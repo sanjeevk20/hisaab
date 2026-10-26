@@ -72,6 +72,36 @@ function paymentFields(body, methods) {
   };
 }
 
+// Report period from ?from=&to= (UTC). Defaults to the current calendar month.
+function period(url) {
+  const ok = (v) => /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?$/.test(v);
+  const pad = (v) => (v.length === 10 ? v + ' 00:00:00' : v);
+  const now = new Date();
+  const from = url.searchParams.get('from') ?? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString().slice(0, 10);
+  const to = url.searchParams.get('to') ?? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).toISOString().slice(0, 10);
+  if (!ok(from) || !ok(to)) throw new HttpError(400, 'from and to must look like 2026-10-01 or 2026-10-01 00:00:00');
+  if (pad(from) >= pad(to)) throw new HttpError(400, 'from must be before to');
+  return { from: pad(from), to: pad(to) };
+}
+
+const money = (paise) => (paise / 100).toFixed(2);
+
+// "2026-10-01_2026-10-31" for a file name; the period's end is exclusive, so show the day before.
+const periodTag = ({ from, to }) =>
+  `${from.slice(0, 10)}_${new Date(Date.parse(to.replace(' ', 'T') + 'Z') - 1000).toISOString().slice(0, 10)}`;
+
+// A CSV download. The route returns this marker object; the handler writes it as a file.
+function csv(filename, rows) {
+  const cell = (v) => {
+    const s = v === null || v === undefined ? '' : String(v);
+    // Quote when needed, and neutralise leading =+-@ so spreadsheets don't run it as a formula.
+    const safe = /^[=+\-@]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s) ? "'" + s : s;
+    return /[",\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+  };
+  return { [CSV]: true, filename, body: '﻿' + rows.map((r) => r.map(cell).join(',')).join('\r\n') + '\r\n' };
+}
+const CSV = Symbol('csv');
+
 function productFields(body, { partial }) {
   const fields = {
     barcode: str(body.barcode, 'barcode', { required: !partial, max: 64 }),
@@ -253,7 +283,74 @@ function routes(store) {
     ['GET', /^\/api\/purchases\/(\d+)$/, (_req, m) => {
       const p = store.getPurchase(Number(m[1]));
       if (!p) throw new HttpError(404, 'Purchase not found');
+      p.returnable = store.returnableFromPurchase(p.id);
       return p;
+    }],
+
+    ['GET', /^\/api\/purchase-returns$/, (_req, _m, url) =>
+      store.listReturns({
+        supplierId: Number(url.searchParams.get('supplier_id')) || undefined,
+        limit: Math.min(Number(url.searchParams.get('limit')) || 50, 500),
+      })],
+
+    ['GET', /^\/api\/purchase-returns\/(\d+)$/, (_req, m) => {
+      const r = store.getReturn(Number(m[1]));
+      if (!r) throw new HttpError(404, 'Return not found');
+      return r;
+    }],
+
+    // Goods back to a supplier: { supplier_id, purchase_id?, items: [{ barcode, quantity, unit_cost? }],
+    //   settlement?: 'adjust' (default, reduces what you owe) | 'refund' (they paid cash back),
+    //   refund_method?, reason?, client_id?, created_at? }
+    ['POST', /^\/api\/purchase-returns$/, async (req) => {
+      const body = await readJson(req);
+      if (!Array.isArray(body.items) || body.items.length === 0) throw new HttpError(400, 'Add at least one item');
+      if (body.items.length > 500) throw new HttpError(400, 'Too many items');
+      const items = body.items.map((it, i) => ({
+        barcode: str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 }),
+        quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }),
+        unit_cost: int(it?.unit_cost, `items[${i}].unit_cost`),
+      }));
+      const settlement = body.settlement ?? 'adjust';
+      if (!['adjust', 'refund'].includes(settlement)) throw new HttpError(400, 'settlement must be adjust or refund');
+      const refund_method = settlement === 'refund' ? body.refund_method ?? 'cash' : null;
+      if (refund_method && !SUPPLIER_PAY.includes(refund_method)) {
+        throw new HttpError(400, `refund_method must be one of ${SUPPLIER_PAY.join(', ')}`);
+      }
+      const r = store.createReturn({
+        supplier_id: int(body.supplier_id, 'supplier_id', { required: true, min: 1 }),
+        purchase_id: int(body.purchase_id, 'purchase_id', { min: 1 }) ?? null,
+        items, settlement, refund_method,
+        reason: str(body.reason, 'reason') ?? null,
+        client_id: str(body.client_id, 'client_id', { max: 64 }) ?? null,
+        created_at: clientTime(body.created_at),
+      });
+      return [r.duplicate ? 200 : 201, r];
+    }],
+
+    // Supplier-wise report for a period. from/to are UTC 'YYYY-MM-DD[ HH:MM:SS]', to is exclusive;
+    // default is the current month. ?format=csv downloads it for a spreadsheet or accountant.
+    ['GET', /^\/api\/reports\/suppliers$/, (_req, _m, url) => {
+      const report = store.supplierReport(period(url));
+      if (url.searchParams.get('format') !== 'csv') return report;
+      return csv(`suppliers_${periodTag(report)}.csv`, [
+        ['Supplier', 'Phone', 'GSTIN', 'Bills', 'Purchased', 'Returned', 'Net purchased', 'Paid', 'Refunded', 'Balance due', 'Last purchase'],
+        ...report.rows.map((r) => [r.name, r.phone, r.gstin, r.bills, money(r.purchased), money(r.returned),
+          money(r.net_purchased), money(r.paid), money(r.refunded), money(r.balance), r.last_purchase_at]),
+        ['Total', '', '', report.totals.bills, money(report.totals.purchased), money(report.totals.returned),
+          money(report.totals.net_purchased), money(report.totals.paid), money(report.totals.refunded), money(report.totals.balance), ''],
+      ]);
+    }],
+
+    ['GET', /^\/api\/reports\/suppliers\/(\d+)$/, (_req, m, url) => {
+      const report = store.supplierItemsReport(Number(m[1]), period(url));
+      if (url.searchParams.get('format') !== 'csv') return report;
+      const slug = report.supplier.name.replace(/[^\w]+/g, '-').toLowerCase();
+      return csv(`${slug}_${periodTag(report)}.csv`, [
+        ['Product', 'Barcode', 'Qty bought', 'Amount', 'Avg cost', 'Qty returned', 'Returned amount', 'Net amount'],
+        ...report.items.map((i) => [i.name, i.barcode, i.bought_qty, money(i.bought_amount), i.avg_cost === null ? '' : money(i.avg_cost),
+          i.returned_qty, money(i.returned_amount), money(i.bought_amount - i.returned_amount)]),
+      ]);
     }],
 
     // Supplier bill: { supplier_id | supplier_name + supplier_phone?, invoice_no?,
@@ -357,6 +454,14 @@ export function createHandler(store, { pin } = {}) {
         const m = url.pathname.match(pattern);
         if (m && req.method === method) {
           const out = await fn(req, m, url);
+          if (out?.[CSV]) {
+            res.writeHead(200, {
+              'content-type': 'text/csv; charset=utf-8',
+              'content-disposition': `attachment; filename="${out.filename}"`,
+              'cache-control': 'no-store',
+            });
+            return res.end(out.body);
+          }
           return Array.isArray(out) && typeof out[0] === 'number' ? send(res, out[0], out[1]) : send(res, 200, out);
         }
       }

@@ -181,3 +181,6 @@ a.btn { text-decoration: none; text-align: center; }
   background: transparent; color: var(--muted); cursor: pointer; }
 .segmented button.active { background: var(--card); color: var(--text); }
 .remove { width: 34px; height: 34px; padding: 0; }
+.toolbar select { flex: 1; }
+.amount-credit { color: var(--brand); font-weight: 700; white-space: nowrap; }
+.report-row .sub span + span::before { content: " · "; }

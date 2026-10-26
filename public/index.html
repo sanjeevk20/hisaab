@@ -84,7 +84,7 @@
           </div>
         </div>
         <div class="grid2">
-          <label>Quantity to add<input name="quantity" type="number" min="1" value="1" inputmode="numeric" required></label>
+          <label><span id="qty-label">Quantity to add</span><input name="quantity" type="number" min="1" value="1" inputmode="numeric" required></label>
           <label class="purchase-only">Cost per unit ₹<input name="unit_cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
         </div>
         <div class="actions">
@@ -94,10 +94,30 @@
       </form>
 
       <div id="purchase" class="card hidden">
+        <div class="segmented" id="purchase-mode" role="tablist">
+          <button data-mode="purchase" class="active" role="tab">Purchase bill</button>
+          <button data-mode="return" role="tab">Return to supplier</button>
+        </div>
         <h2 id="purchase-title">Supplier bill</h2>
+        <label class="return-only">Against bill (optional)
+          <select id="return-bill"><option value="">Not linked to a bill</option></select></label>
         <ul id="purchase-lines" class="list"></ul>
         <p id="purchase-empty" class="empty">Scan each item on the supplier's bill.</p>
-        <div class="row total"><span>Bill total</span><strong id="purchase-total">₹0.00</strong></div>
+        <div class="row total"><span id="purchase-total-label">Bill total</span><strong id="purchase-total">₹0.00</strong></div>
+        <div class="return-only">
+          <div class="pay-methods" id="return-settlement">
+            <label><input type="radio" name="settle" value="adjust" checked> Reduce what I owe</label>
+            <label><input type="radio" name="settle" value="refund"> Got cash back</label>
+          </div>
+          <div class="pay-methods hidden" id="refund-method">
+            <label><input type="radio" name="rmethod" value="cash" checked> Cash</label>
+            <label><input type="radio" name="rmethod" value="upi"> UPI</label>
+            <label><input type="radio" name="rmethod" value="bank"> Bank</label>
+            <label><input type="radio" name="rmethod" value="cheque"> Cheque</label>
+          </div>
+          <label>Reason (optional)<input id="return-reason" placeholder="Damaged, expired, wrong item…" autocomplete="off"></label>
+        </div>
+        <div class="buy-only">
         <label>Supplier invoice no. (optional)<input id="purchase-invoice" autocomplete="off"></label>
         <label>Paid now ₹<input id="purchase-paid" type="number" min="0" step="0.01" value="0" inputmode="decimal"></label>
         <div class="pay-methods" id="purchase-method">
@@ -105,6 +125,7 @@
           <label><input type="radio" name="pmethod" value="upi"> UPI</label>
           <label><input type="radio" name="pmethod" value="bank"> Bank</label>
           <label><input type="radio" name="pmethod" value="cheque"> Cheque</label>
+        </div>
         </div>
         <p id="purchase-due" class="muted"></p>
         <div class="actions">
@@ -141,9 +162,29 @@
 
     <!-- Sales -->
     <section id="view-sales" class="view">
-      <div id="summary" class="stats"></div>
-      <h2>Recent bills</h2>
-      <ul id="sales-list" class="list"></ul>
+      <div class="segmented" id="report-side" role="tablist">
+        <button data-side="sales" class="active" role="tab">Sales</button>
+        <button data-side="suppliers" role="tab">Suppliers</button>
+      </div>
+      <div id="sales-panel">
+        <div id="summary" class="stats"></div>
+        <h2>Recent bills</h2>
+        <ul id="sales-list" class="list"></ul>
+      </div>
+      <div id="supplier-report" class="hidden">
+        <div class="toolbar">
+          <select id="report-period">
+            <option value="month">This month</option>
+            <option value="last-month">Last month</option>
+            <option value="quarter">Last 3 months</option>
+            <option value="fy">This financial year (from 1 April)</option>
+            <option value="all">All time</option>
+          </select>
+          <button id="report-csv" class="btn" type="button">⬇ CSV</button>
+        </div>
+        <div id="report-totals" class="stats"></div>
+        <ul id="report-list" class="list"></ul>
+      </div>
     </section>
   </main>
 
@@ -152,7 +193,7 @@
     <button data-view="stock">📦<span>Stock in</span></button>
     <button data-view="inventory">📋<span>Inventory</span></button>
     <button data-view="khata">📒<span>Khata</span></button>
-    <button data-view="sales">📈<span>Sales</span></button>
+    <button data-view="sales">📈<span>Reports</span></button>
   </nav>
 
   <dialog id="modal"><div id="modal-body"></div></dialog>

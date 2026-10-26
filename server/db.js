@@ -3,6 +3,44 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
+// Tables whose CHECK rules have grown since the first release. Older databases are rebuilt
+// to these definitions on open (see rebuildIfOutdated); `marker` is text only the current version has.
+const STOCK_MOVEMENTS = `
+-- Ledger of every stock change, so the current quantity is always explainable.
+CREATE TABLE IF NOT EXISTS stock_movements (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id   INTEGER NOT NULL REFERENCES products(id),
+  change       INTEGER NOT NULL,
+  reason       TEXT NOT NULL CHECK (reason IN ('stock_in', 'sale', 'adjustment', 'purchase_return')),
+  sale_id      INTEGER REFERENCES sales(id),
+  purchase_id  INTEGER REFERENCES purchases(id),
+  return_id    INTEGER REFERENCES purchase_returns(id),
+  note         TEXT,
+  client_id    TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);`;
+
+const SUPPLIER_LEDGER = `
+-- What the shop owes each supplier. Same shape as ledger_entries, the other way round.
+-- 'payment' and 'return' reduce the balance; the rest increase it.
+CREATE TABLE IF NOT EXISTS supplier_ledger (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  supplier_id  INTEGER NOT NULL REFERENCES suppliers(id),
+  type         TEXT NOT NULL CHECK (type IN ('opening', 'purchase', 'payment', 'return', 'refund')),
+  amount       INTEGER NOT NULL CHECK (amount > 0),
+  purchase_id  INTEGER REFERENCES purchases(id),
+  return_id    INTEGER REFERENCES purchase_returns(id),
+  method       TEXT,
+  note         TEXT,
+  client_id    TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);`;
+
+const REBUILDS = [
+  ['stock_movements', STOCK_MOVEMENTS, "'purchase_return'"],
+  ['supplier_ledger', SUPPLIER_LEDGER, "'refund'"],
+];
+
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -51,16 +89,7 @@ CREATE TABLE IF NOT EXISTS sale_items (
   line_total  INTEGER NOT NULL
 );
 
--- Ledger of every stock change, so the current quantity is always explainable.
-CREATE TABLE IF NOT EXISTS stock_movements (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  product_id  INTEGER NOT NULL REFERENCES products(id),
-  change      INTEGER NOT NULL,
-  reason      TEXT NOT NULL CHECK (reason IN ('stock_in', 'sale', 'adjustment')),
-  sale_id     INTEGER REFERENCES sales(id),
-  note        TEXT,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
+${STOCK_MOVEMENTS}
 
 -- Udhaar (credit) khata. amount is always positive; the type says which way it moves the balance.
 CREATE TABLE IF NOT EXISTS ledger_entries (
@@ -107,17 +136,31 @@ CREATE TABLE IF NOT EXISTS purchase_items (
   line_total   INTEGER NOT NULL
 );
 
--- What the shop owes each supplier. Same shape as ledger_entries, the other way round.
-CREATE TABLE IF NOT EXISTS supplier_ledger (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  supplier_id  INTEGER NOT NULL REFERENCES suppliers(id),
-  type         TEXT NOT NULL CHECK (type IN ('opening', 'purchase', 'payment')),
-  amount       INTEGER NOT NULL CHECK (amount > 0),
-  purchase_id  INTEGER REFERENCES purchases(id),
-  method       TEXT,
-  note         TEXT,
-  client_id    TEXT,
-  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+${SUPPLIER_LEDGER}
+
+-- Goods sent back to a supplier (damaged, expired, wrong item). Reduces stock and what we owe;
+-- with settlement 'refund' the supplier paid cash back instead, so the balance nets out.
+CREATE TABLE IF NOT EXISTS purchase_returns (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  supplier_id     INTEGER NOT NULL REFERENCES suppliers(id),
+  purchase_id     INTEGER REFERENCES purchases(id),
+  total           INTEGER NOT NULL,
+  settlement      TEXT NOT NULL CHECK (settlement IN ('adjust', 'refund')),
+  refund_method   TEXT,
+  reason          TEXT,
+  client_id       TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS purchase_return_items (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  return_id   INTEGER NOT NULL REFERENCES purchase_returns(id),
+  product_id  INTEGER NOT NULL REFERENCES products(id),
+  barcode     TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  quantity    INTEGER NOT NULL CHECK (quantity > 0),
+  unit_cost   INTEGER NOT NULL,
+  line_total  INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
@@ -131,6 +174,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_purchases_client ON purchases(client_id) W
 CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_ledger_client ON supplier_ledger(client_id) WHERE client_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id);
 CREATE INDEX IF NOT EXISTS idx_supplier_ledger_supplier ON supplier_ledger(supplier_id);
+CREATE INDEX IF NOT EXISTS idx_returns_supplier ON purchase_returns(supplier_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_returns_client ON purchase_returns(client_id) WHERE client_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_return_items_return ON purchase_return_items(return_id);
+CREATE INDEX IF NOT EXISTS idx_purchases_supplier ON purchases(supplier_id, created_at);
 `;
 
 // Columns added after the first release; applied to existing databases on open.
@@ -158,7 +205,7 @@ const PARTIES = {
   },
 };
 
-const BALANCE_SQL = `COALESCE(SUM(CASE WHEN l.type = 'payment' THEN -l.amount ELSE l.amount END), 0)`;
+const BALANCE_SQL = `COALESCE(SUM(CASE WHEN l.type IN ('payment', 'return') THEN -l.amount ELSE l.amount END), 0)`;
 
 export class HttpError extends Error {
   constructor(status, message) {
@@ -175,8 +222,31 @@ export function openDb(path = 'data/hisaab.db') {
     const exists = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
     if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
+  for (const [table, createSql, marker] of REBUILDS) rebuildIfOutdated(db, table, createSql, marker);
+  db.exec(SCHEMA); // recreate indexes dropped by a rebuild
   db.exec(POST_MIGRATION);
   return new Store(db);
+}
+
+// SQLite can't change a CHECK constraint in place, so copy the table into the new definition.
+function rebuildIfOutdated(db, table, createSql, marker) {
+  const { sql } = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+  if (sql.includes(marker)) return;
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name).join(', ');
+  db.exec('PRAGMA foreign_keys = OFF');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(`ALTER TABLE ${table} RENAME TO ${table}_old`);
+    db.exec(createSql);
+    db.exec(`INSERT INTO ${table} (${cols}) SELECT ${cols} FROM ${table}_old`);
+    db.exec(`DROP TABLE ${table}_old`);
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
 }
 
 export function normalizePhone(phone) {
@@ -304,7 +374,10 @@ class Store {
   recordSupplierPayment(id, payment) { return this.#recordPartyPayment(PARTIES.supplier, id, payment); }
   getSupplier(id) {
     const s = this.#getParty(PARTIES.supplier, id);
-    if (s) s.purchases = this.db.prepare('SELECT * FROM purchases WHERE supplier_id = ? ORDER BY created_at DESC, id DESC LIMIT 50').all(id);
+    if (s) {
+      s.purchases = this.db.prepare('SELECT * FROM purchases WHERE supplier_id = ? ORDER BY created_at DESC, id DESC LIMIT 50').all(id);
+      s.returns = this.db.prepare('SELECT * FROM purchase_returns WHERE supplier_id = ? ORDER BY created_at DESC, id DESC LIMIT 50').all(id);
+    }
     return s;
   }
 
@@ -488,6 +561,199 @@ class Store {
     sql += ' ORDER BY p.created_at DESC, p.id DESC LIMIT ?';
     params.push(limit);
     return this.db.prepare(sql).all(...params);
+  }
+
+  // --- purchase returns -------------------------------------------------
+
+  // Sends goods back to a supplier. Stock goes down and the value comes off what we owe them
+  // (settlement 'adjust'), or is recorded as a cash refund ('refund'), which leaves the balance as is.
+  // With purchase_id, each line must be on that bill and can't exceed what is left to return from it;
+  // unit_cost then defaults to that bill's cost, otherwise to the product's current cost price.
+  // items: [{ barcode, quantity, unit_cost? }]
+  createReturn({
+    supplier_id, purchase_id = null, items, settlement = 'adjust', refund_method = null, reason = null,
+    client_id = null, created_at = null,
+  }) {
+    return this.transaction(() => {
+      if (client_id) {
+        const seen = this.db.prepare('SELECT id FROM purchase_returns WHERE client_id = ?').get(client_id);
+        if (seen) return { ...this.getReturn(seen.id), duplicate: true };
+      }
+      const supplier = this.db.prepare('SELECT * FROM suppliers WHERE id = ?').get(supplier_id);
+      if (!supplier) throw new HttpError(404, 'Supplier not found');
+
+      let billLines = null;
+      if (purchase_id) {
+        const bill = this.db.prepare('SELECT * FROM purchases WHERE id = ?').get(purchase_id);
+        if (!bill || bill.supplier_id !== supplier.id) throw new HttpError(400, `Purchase #${purchase_id} is not from ${supplier.name}`);
+        billLines = this.returnableFromPurchase(purchase_id);
+      }
+
+      // Merge repeated barcodes so the stock and bill checks see the full quantity.
+      const merged = new Map();
+      for (const item of items) {
+        const line = merged.get(item.barcode) ?? { ...item, quantity: 0 };
+        line.quantity += item.quantity;
+        if (item.unit_cost !== undefined) line.unit_cost = item.unit_cost;
+        merged.set(item.barcode, line);
+      }
+
+      const lines = [];
+      for (const item of merged.values()) {
+        const p = this.getByBarcode(item.barcode);
+        if (!p) throw new HttpError(404, `Product ${item.barcode} not found`);
+        if (p.quantity < item.quantity) throw new HttpError(409, `Only ${p.quantity} of ${p.name} in stock to return`);
+        let unitCost = item.unit_cost ?? p.cost;
+        if (billLines) {
+          const billLine = billLines.find((l) => l.product_id === p.id);
+          if (!billLine) throw new HttpError(400, `${p.name} is not on purchase #${purchase_id}`);
+          if (item.quantity > billLine.returnable) {
+            throw new HttpError(409, `Only ${billLine.returnable} of ${p.name} left to return from purchase #${purchase_id}`);
+          }
+          unitCost = item.unit_cost ?? billLine.unit_cost;
+        }
+        lines.push({ p, quantity: item.quantity, unit_cost: unitCost, line_total: unitCost * item.quantity });
+      }
+      const total = lines.reduce((s, l) => s + l.line_total, 0);
+
+      const { lastInsertRowid: returnId } = this.db
+        .prepare(
+          `INSERT INTO purchase_returns (supplier_id, purchase_id, total, settlement, refund_method, reason, client_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+        )
+        .run(supplier.id, purchase_id, total, settlement, settlement === 'refund' ? refund_method : null, reason, client_id, created_at);
+
+      const insertItem = this.db.prepare(
+        `INSERT INTO purchase_return_items (return_id, product_id, barcode, name, quantity, unit_cost, line_total)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const { p, quantity, unit_cost, line_total } of lines) {
+        insertItem.run(returnId, p.id, p.barcode, p.name, quantity, unit_cost, line_total);
+        this.db
+          .prepare("UPDATE products SET quantity = quantity - ?, updated_at = datetime('now') WHERE id = ?")
+          .run(quantity, p.id);
+        this.db
+          .prepare(
+            `INSERT INTO stock_movements (product_id, change, reason, return_id, purchase_id, note)
+             VALUES (?, ?, 'purchase_return', ?, ?, ?)`
+          )
+          .run(p.id, -quantity, returnId, purchase_id, `Returned to ${supplier.name}${reason ? ' — ' + reason : ''}`);
+      }
+
+      if (total > 0) {
+        const ledger = this.db.prepare(
+          `INSERT INTO supplier_ledger (supplier_id, type, amount, return_id, purchase_id, method, note, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+        );
+        ledger.run(supplier.id, 'return', total, returnId, purchase_id, null, reason, created_at);
+        if (settlement === 'refund') {
+          ledger.run(supplier.id, 'refund', total, returnId, purchase_id, refund_method, 'Cash back for return', created_at);
+        }
+      }
+      return { ...this.getReturn(returnId), duplicate: false };
+    });
+  }
+
+  // Lines of a purchase with how many units are still returnable after earlier returns against it.
+  returnableFromPurchase(purchaseId) {
+    return this.db
+      .prepare(
+        `SELECT pi.product_id, pi.barcode, pi.name, pi.unit_cost, SUM(pi.quantity) AS bought,
+                COALESCE((SELECT SUM(ri.quantity) FROM purchase_return_items ri JOIN purchase_returns r ON r.id = ri.return_id
+                          WHERE r.purchase_id = pi.purchase_id AND ri.product_id = pi.product_id), 0) AS returned
+         FROM purchase_items pi WHERE pi.purchase_id = ? GROUP BY pi.product_id`
+      )
+      .all(purchaseId)
+      .map((l) => ({ ...l, returnable: l.bought - l.returned }));
+  }
+
+  getReturn(id) {
+    const r = this.db
+      .prepare('SELECT r.*, s.name AS supplier_name FROM purchase_returns r JOIN suppliers s ON s.id = r.supplier_id WHERE r.id = ?')
+      .get(id);
+    if (!r) return null;
+    r.items = this.db.prepare('SELECT * FROM purchase_return_items WHERE return_id = ? ORDER BY id').all(id);
+    return r;
+  }
+
+  listReturns({ supplierId, limit = 50 } = {}) {
+    let sql = 'SELECT r.*, s.name AS supplier_name FROM purchase_returns r JOIN suppliers s ON s.id = r.supplier_id';
+    const params = [];
+    if (supplierId) {
+      sql += ' WHERE r.supplier_id = ?';
+      params.push(supplierId);
+    }
+    sql += ' ORDER BY r.created_at DESC, r.id DESC LIMIT ?';
+    params.push(limit);
+    return this.db.prepare(sql).all(...params);
+  }
+
+  // --- supplier reports -------------------------------------------------
+
+  // One row per supplier for [from, to): bills, amounts bought/returned/paid in the period, plus
+  // the current balance and last purchase (all-time). Suppliers with no activity and no dues are left out.
+  supplierReport({ from, to }) {
+    const inRange = (alias) => `${alias}.created_at >= ? AND ${alias}.created_at < ?`;
+    const rows = this.db
+      .prepare(
+        `SELECT s.id, s.name, s.phone, s.gstin,
+           (SELECT COUNT(*) FROM purchases p WHERE p.supplier_id = s.id AND ${inRange('p')}) AS bills,
+           (SELECT COALESCE(SUM(total), 0) FROM purchases p WHERE p.supplier_id = s.id AND ${inRange('p')}) AS purchased,
+           (SELECT COALESCE(SUM(total), 0) FROM purchase_returns r WHERE r.supplier_id = s.id AND ${inRange('r')}) AS returned,
+           (SELECT COALESCE(SUM(amount), 0) FROM supplier_ledger l WHERE l.supplier_id = s.id AND l.type = 'payment' AND ${inRange('l')}) AS paid,
+           (SELECT COALESCE(SUM(amount), 0) FROM supplier_ledger l WHERE l.supplier_id = s.id AND l.type = 'refund' AND ${inRange('l')}) AS refunded,
+           (SELECT ${BALANCE_SQL} FROM supplier_ledger l WHERE l.supplier_id = s.id) AS balance,
+           (SELECT MAX(created_at) FROM purchases p WHERE p.supplier_id = s.id) AS last_purchase_at
+         FROM suppliers s`
+      )
+      .all(from, to, from, to, from, to, from, to, from, to)
+      .map((r) => ({ ...r, net_purchased: r.purchased - r.returned }))
+      .filter((r) => r.bills || r.returned || r.paid || r.refunded || r.balance)
+      .sort((a, b) => b.net_purchased - a.net_purchased || b.balance - a.balance);
+    const totals = {};
+    for (const key of ['bills', 'purchased', 'returned', 'net_purchased', 'paid', 'refunded', 'balance']) {
+      totals[key] = rows.reduce((sum, r) => sum + r[key], 0);
+    }
+    return { from, to, rows, totals };
+  }
+
+  // What was bought from one supplier in [from, to), product by product, net of returns.
+  supplierItemsReport(supplierId, { from, to }) {
+    const supplier = this.getSupplier(supplierId);
+    if (!supplier) throw new HttpError(404, 'Supplier not found');
+    const items = this.db
+      .prepare(
+        `WITH bought AS (
+           SELECT pi.product_id, SUM(pi.quantity) AS qty, SUM(pi.line_total) AS amount
+           FROM purchase_items pi JOIN purchases p ON p.id = pi.purchase_id
+           WHERE p.supplier_id = ? AND p.created_at >= ? AND p.created_at < ? GROUP BY pi.product_id),
+         back AS (
+           SELECT ri.product_id, SUM(ri.quantity) AS qty, SUM(ri.line_total) AS amount
+           FROM purchase_return_items ri JOIN purchase_returns r ON r.id = ri.return_id
+           WHERE r.supplier_id = ? AND r.created_at >= ? AND r.created_at < ? GROUP BY ri.product_id)
+         SELECT pr.id AS product_id, pr.barcode, pr.name,
+                COALESCE(b.qty, 0) AS bought_qty, COALESCE(b.amount, 0) AS bought_amount,
+                COALESCE(k.qty, 0) AS returned_qty, COALESCE(k.amount, 0) AS returned_amount
+         FROM products pr
+         LEFT JOIN bought b ON b.product_id = pr.id
+         LEFT JOIN back k ON k.product_id = pr.id
+         WHERE b.product_id IS NOT NULL OR k.product_id IS NOT NULL
+         ORDER BY COALESCE(b.amount, 0) - COALESCE(k.amount, 0) DESC, pr.name COLLATE NOCASE`
+      )
+      .all(supplierId, from, to, supplierId, from, to)
+      .map((i) => ({ ...i, avg_cost: i.bought_qty ? Math.round(i.bought_amount / i.bought_qty) : null }));
+    const summary = this.supplierReport({ from, to }).rows.find((r) => r.id === supplierId) ?? {
+      bills: 0, purchased: 0, returned: 0, net_purchased: 0, paid: 0, refunded: 0, balance: supplier.balance,
+    };
+    const inRange = 'supplier_id = ? AND created_at >= ? AND created_at < ? ORDER BY created_at DESC, id DESC';
+    return {
+      from, to,
+      supplier: { id: supplier.id, name: supplier.name, phone: supplier.phone, gstin: supplier.gstin, balance: supplier.balance },
+      summary,
+      items,
+      purchases: this.db.prepare(`SELECT * FROM purchases WHERE ${inRange}`).all(supplierId, from, to),
+      returns: this.db.prepare(`SELECT * FROM purchase_returns WHERE ${inRange}`).all(supplierId, from, to),
+    };
   }
 
   // --- sales ------------------------------------------------------------
