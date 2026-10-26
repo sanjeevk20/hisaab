@@ -17,6 +17,8 @@ const MIME = {
   '.png': 'image/png',
 };
 const PAYMENT_METHODS = ['cash', 'upi', 'card', 'credit'];
+const CUSTOMER_PAY = ['cash', 'upi', 'card'];
+const SUPPLIER_PAY = ['cash', 'upi', 'bank', 'cheque'];
 
 // --- validation helpers -------------------------------------------------
 
@@ -56,6 +58,18 @@ function clientTime(v) {
   if (Number.isNaN(t)) throw new HttpError(400, 'created_at must be an ISO date');
   if (t > Date.now() + 5 * 60_000) throw new HttpError(400, 'created_at is in the future');
   return new Date(t).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function paymentFields(body, methods) {
+  const method = body.method ?? 'cash';
+  if (!methods.includes(method)) throw new HttpError(400, `method must be one of ${methods.join(', ')}`);
+  return {
+    amount: int(body.amount, 'amount', { required: true, min: 1 }),
+    method,
+    note: str(body.note, 'note') ?? null,
+    client_id: str(body.client_id, 'client_id', { max: 64 }) ?? null,
+    created_at: clientTime(body.created_at),
+  };
 }
 
 function productFields(body, { partial }) {
@@ -200,17 +214,84 @@ function routes(store) {
 
     // { amount, method?, note?, client_id?, created_at? }
     ['POST', /^\/api\/customers\/(\d+)\/payments$/, async (req, m) => {
+      const { duplicate, party } = store.recordPayment(Number(m[1]), paymentFields(await readJson(req), CUSTOMER_PAY));
+      return [duplicate ? 200 : 201, party];
+    }],
+
+    ['GET', /^\/api\/suppliers$/, (_req, _m, url) =>
+      store.listSuppliers({ q: url.searchParams.get('q'), dueOnly: url.searchParams.get('due') === '1' })],
+
+    // { name, phone?, gstin?, opening_balance? } — opening_balance is what the shop already owes them.
+    ['POST', /^\/api\/suppliers$/, async (req) => {
       const body = await readJson(req);
-      const method = body.method ?? 'cash';
-      if (!['cash', 'upi', 'card'].includes(method)) throw new HttpError(400, 'method must be cash, upi or card');
-      const { duplicate, customer } = store.recordPayment(Number(m[1]), {
-        amount: int(body.amount, 'amount', { required: true, min: 1 }),
-        method,
+      return [201, store.createSupplier({
+        name: str(body.name, 'name', { required: true }),
+        phone: str(body.phone, 'phone', { max: 20 }) ?? null,
+        gstin: str(body.gstin, 'gstin', { max: 20 }) ?? null,
+        opening_balance: int(body.opening_balance, 'opening_balance') ?? 0,
+      })];
+    }],
+
+    ['GET', /^\/api\/suppliers\/(\d+)$/, (_req, m) => {
+      const s = store.getSupplier(Number(m[1]));
+      if (!s) throw new HttpError(404, 'Supplier not found');
+      return s;
+    }],
+
+    // Paying a supplier: { amount, method?, note?, client_id?, created_at? }
+    ['POST', /^\/api\/suppliers\/(\d+)\/payments$/, async (req, m) => {
+      const { duplicate, party } = store.recordSupplierPayment(Number(m[1]), paymentFields(await readJson(req), SUPPLIER_PAY));
+      return [duplicate ? 200 : 201, party];
+    }],
+
+    ['GET', /^\/api\/purchases$/, (_req, _m, url) =>
+      store.listPurchases({
+        supplierId: Number(url.searchParams.get('supplier_id')) || undefined,
+        limit: Math.min(Number(url.searchParams.get('limit')) || 50, 500),
+      })],
+
+    ['GET', /^\/api\/purchases\/(\d+)$/, (_req, m) => {
+      const p = store.getPurchase(Number(m[1]));
+      if (!p) throw new HttpError(404, 'Purchase not found');
+      return p;
+    }],
+
+    // Supplier bill: { supplier_id | supplier_name + supplier_phone?, invoice_no?,
+    //   items: [{ barcode, quantity, unit_cost, name?, price?, gst_rate?, low_stock? }],
+    //   paid?, payment_method?, note?, client_id?, created_at? }
+    // New barcodes need name and price (selling price). Unpaid amount goes on the supplier's khata.
+    ['POST', /^\/api\/purchases$/, async (req) => {
+      const body = await readJson(req);
+      if (!Array.isArray(body.items) || body.items.length === 0) throw new HttpError(400, 'Add at least one item');
+      if (body.items.length > 500) throw new HttpError(400, 'Too many items');
+      const items = body.items.map((it, i) => ({
+        barcode: str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 }),
+        quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }),
+        unit_cost: int(it?.unit_cost, `items[${i}].unit_cost`, { required: true }),
+        name: str(it?.name, `items[${i}].name`),
+        price: int(it?.price, `items[${i}].price`),
+        gst_rate: rate(it?.gst_rate),
+        low_stock: int(it?.low_stock, `items[${i}].low_stock`, { max: 1e6 }),
+      }));
+      const supplier_id = int(body.supplier_id, 'supplier_id', { min: 1 }) ?? null;
+      const supplier_name = str(body.supplier_name, 'supplier_name') ?? null;
+      if (!supplier_id && !supplier_name) throw new HttpError(400, 'Choose a supplier');
+      const paid = int(body.paid, 'paid') ?? 0;
+      const payment_method = body.payment_method ?? 'cash';
+      if (paid && !SUPPLIER_PAY.includes(payment_method)) {
+        throw new HttpError(400, `payment_method must be one of ${SUPPLIER_PAY.join(', ')}`);
+      }
+      const purchase = store.createPurchase({
+        supplier_id, supplier_name,
+        supplier_phone: str(body.supplier_phone, 'supplier_phone', { max: 20 }) ?? null,
+        invoice_no: str(body.invoice_no, 'invoice_no', { max: 64 }) ?? null,
+        items, paid,
+        payment_method: paid ? payment_method : null,
         note: str(body.note, 'note') ?? null,
         client_id: str(body.client_id, 'client_id', { max: 64 }) ?? null,
         created_at: clientTime(body.created_at),
       });
-      return [duplicate ? 200 : 201, customer];
+      return [purchase.duplicate ? 200 : 201, purchase];
     }],
 
     ['GET', /^\/api\/sales$/, (_req, _m, url) =>
@@ -284,6 +365,9 @@ export function createHandler(store, { pin } = {}) {
       if (err instanceof HttpError) return send(res, err.status, { error: err.message });
       if (/UNIQUE constraint failed: products\.barcode/.test(err?.message)) {
         return send(res, 409, { error: 'Another product already uses this barcode' });
+      }
+      if (/UNIQUE constraint failed: suppliers\.phone/.test(err?.message)) {
+        return send(res, 409, { error: 'Another supplier already uses this phone number' });
       }
       if (/UNIQUE constraint failed: customers\.phone/.test(err?.message)) {
         return send(res, 409, { error: 'Another customer already uses this phone number' });

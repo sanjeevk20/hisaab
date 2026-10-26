@@ -55,6 +55,9 @@
 
     <!-- Stock in -->
     <section id="view-stock" class="view">
+      <label class="supplier-bar">Supplier
+        <select id="purchase-supplier"><option value="">Quick stock in (no supplier bill)</option></select>
+      </label>
       <div class="scanner" data-scanner="stock">
         <video playsinline muted></video>
         <div class="scan-frame"></div>
@@ -73,20 +76,43 @@
           <label>Name<input name="name" required autocomplete="off"></label>
           <div class="grid2">
             <label>Selling price ₹<input name="price" type="number" min="0" step="0.01" inputmode="decimal" required></label>
-            <label>Cost price ₹<input name="cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
+            <label class="quick-only">Cost price ₹<input name="cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
             <label>GST %<select name="gst_rate">
               <option value="0">0</option><option value="5">5</option><option value="12">12</option>
               <option value="18">18</option><option value="28">28</option></select></label>
             <label>Low-stock alert at<input name="low_stock" type="number" min="0" value="5" inputmode="numeric"></label>
           </div>
         </div>
-        <label>Quantity to add<input name="quantity" type="number" min="1" value="1" inputmode="numeric" required></label>
+        <div class="grid2">
+          <label>Quantity to add<input name="quantity" type="number" min="1" value="1" inputmode="numeric" required></label>
+          <label class="purchase-only">Cost per unit ₹<input name="unit_cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
+        </div>
         <div class="actions">
           <button class="btn ghost" type="button" id="stock-cancel">Cancel</button>
-          <button class="btn primary">Add to stock</button>
+          <button class="btn primary" id="stock-submit">Add to stock</button>
         </div>
       </form>
-      <p class="empty" id="stock-hint">Scan a product's barcode to add it to inventory. New barcodes ask for name and price once.</p>
+
+      <div id="purchase" class="card hidden">
+        <h2 id="purchase-title">Supplier bill</h2>
+        <ul id="purchase-lines" class="list"></ul>
+        <p id="purchase-empty" class="empty">Scan each item on the supplier's bill.</p>
+        <div class="row total"><span>Bill total</span><strong id="purchase-total">₹0.00</strong></div>
+        <label>Supplier invoice no. (optional)<input id="purchase-invoice" autocomplete="off"></label>
+        <label>Paid now ₹<input id="purchase-paid" type="number" min="0" step="0.01" value="0" inputmode="decimal"></label>
+        <div class="pay-methods" id="purchase-method">
+          <label><input type="radio" name="pmethod" value="cash" checked> Cash</label>
+          <label><input type="radio" name="pmethod" value="upi"> UPI</label>
+          <label><input type="radio" name="pmethod" value="bank"> Bank</label>
+          <label><input type="radio" name="pmethod" value="cheque"> Cheque</label>
+        </div>
+        <p id="purchase-due" class="muted"></p>
+        <div class="actions">
+          <button class="btn ghost" type="button" id="purchase-discard">Discard</button>
+          <button class="btn primary" type="button" id="purchase-save">Save purchase</button>
+        </div>
+      </div>
+      <p class="empty" id="stock-hint"></p>
     </section>
 
     <!-- Inventory -->
@@ -98,15 +124,19 @@
       <ul id="inv-list" class="list"></ul>
     </section>
 
-    <!-- Udhaar khata -->
-    <section id="view-udhaar" class="view">
-      <div class="stats one"><div><strong id="udhaar-total">₹0.00</strong><span>Total udhaar outstanding</span></div></div>
-      <div class="toolbar">
-        <input id="cust-search" type="search" placeholder="Search name or phone">
-        <label class="chip"><input type="checkbox" id="cust-due-only" checked> Dues only</label>
+    <!-- Khata: udhaar from customers, dues to suppliers -->
+    <section id="view-khata" class="view">
+      <div class="segmented" id="khata-side" role="tablist">
+        <button data-side="customer" class="active" role="tab">Customers owe you</button>
+        <button data-side="supplier" role="tab">You owe suppliers</button>
       </div>
-      <button id="add-customer" class="btn wide" type="button">+ Add customer / opening balance</button>
-      <ul id="cust-list" class="list"></ul>
+      <div class="stats one"><div><strong id="khata-total">₹0.00</strong><span id="khata-total-label">Total udhaar outstanding</span></div></div>
+      <div class="toolbar">
+        <input id="khata-search" type="search" placeholder="Search name or phone">
+        <label class="chip"><input type="checkbox" id="khata-due-only" checked> Dues only</label>
+      </div>
+      <button id="add-party" class="btn wide" type="button">+ Add customer / opening balance</button>
+      <ul id="khata-list" class="list"></ul>
     </section>
 
     <!-- Sales -->
@@ -121,7 +151,7 @@
     <button data-view="bill" class="active">🧾<span>Bill</span></button>
     <button data-view="stock">📦<span>Stock in</span></button>
     <button data-view="inventory">📋<span>Inventory</span></button>
-    <button data-view="udhaar">📒<span>Udhaar</span></button>
+    <button data-view="khata">📒<span>Khata</span></button>
     <button data-view="sales">📈<span>Sales</span></button>
   </nav>
 

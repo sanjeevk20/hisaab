@@ -14,7 +14,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const localTime = (s) => new Date(s.replace(' ', 'T') + 'Z').toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
 const digits = (s) => String(s ?? '').replace(/\D/g, '').replace(/^91(\d{10})$/, '$1');
 const SHOP_NAME = localStorage.getItem('hisaab.shop') || 'My Shop';
-const PAY_LABEL = { cash: 'Cash', upi: 'UPI', card: 'Card', credit: 'Udhaar' };
+const PAY_LABEL = { cash: 'Cash', upi: 'UPI', card: 'Card', credit: 'Udhaar', bank: 'Bank', cheque: 'Cheque' };
 const OFFLINE_NOTE = '<p class="notice">Offline — showing the copy saved on this phone.</p>';
 
 let toastTimer;
@@ -424,10 +424,153 @@ function showReceipt(sale) {
   $('[data-print]', modal).onclick = () => window.print();
 }
 
-// --- stock in -----------------------------------------------------------
+// --- stock in & supplier purchases -------------------------------------
 
+// With no supplier chosen, each scan goes straight into stock ("quick stock in").
+// With a supplier chosen, scans build up that supplier's bill, saved in one go as a purchase.
 const stockForm = $('#stock-form');
 let stockProduct = null;
+let purchase = { supplier: null, lines: [] }; // supplier: { id, name, phone }; id null = created on save
+const inPurchase = () => purchase.supplier !== null;
+const savedSuppliers = async () => (await kvGet('get:/suppliers')) ?? [];
+const savePurchaseDraft = () => kvSet('purchase-draft', purchase);
+
+async function fillSupplierSelect() {
+  const s = purchase.supplier;
+  $('#purchase-supplier').innerHTML = '<option value="">Quick stock in (no supplier bill)</option>'
+    + (await savedSuppliers()).map((x) => `<option value="${x.id}">${esc(x.name)}${x.balance > 0 ? ` · you owe ${rupees(x.balance)}` : ''}</option>`).join('')
+    + (s && s.id === null ? `<option value="draft">${esc(s.name)} (new)</option>` : '')
+    + '<option value="new">+ New supplier…</option>';
+  $('#purchase-supplier').value = s ? String(s.id ?? 'draft') : '';
+}
+
+function afterSupplierChange() {
+  savePurchaseDraft();
+  fillSupplierSelect();
+  renderPurchase();
+  closeStockForm();
+}
+
+$('#purchase-supplier').onchange = async (e) => {
+  const v = e.target.value;
+  if (v === 'draft') return;
+  if (v === 'new') {
+    return partyForm('supplier', { allowOffline: true }, (s) => {
+      if (s) purchase.supplier = { id: s.id, name: s.name, phone: s.phone };
+      afterSupplierChange();
+    });
+  }
+  if (v && purchase.lines.length && !confirm('Switch supplier? Items scanned so far stay on the bill.')) return fillSupplierSelect();
+  if (!v) {
+    if (purchase.lines.length && !confirm('Discard the supplier bill you are building?')) return fillSupplierSelect();
+    purchase = { supplier: null, lines: [] };
+  } else {
+    const s = (await savedSuppliers()).find((x) => x.id === Number(v));
+    purchase.supplier = { id: s.id, name: s.name, phone: s.phone };
+  }
+  afterSupplierChange();
+};
+
+function purchaseTotal() {
+  return purchase.lines.reduce((s, l) => s + l.quantity * l.unit_cost, 0);
+}
+
+function renderPurchase() {
+  $('#purchase').classList.toggle('hidden', !inPurchase());
+  $('#stock-hint').textContent = inPurchase()
+    ? ''
+    : "Scan a product's barcode to add it to inventory. New barcodes ask for name and price once. Got a supplier bill? Pick the supplier above.";
+  if (!inPurchase()) return;
+  $('#purchase-title').textContent = `Bill from ${purchase.supplier.name}`;
+  $('#purchase-lines').innerHTML = purchase.lines.map((l, i) => `
+    <li>
+      <div class="grow">
+        <div class="title">${esc(l.name)}${l.isNew ? ' <span class="badge">new</span>' : ''}</div>
+        <div class="sub">${l.quantity} × ${rupees(l.unit_cost)} = <strong>${rupees(l.quantity * l.unit_cost)}</strong></div>
+      </div>
+      <button class="btn remove danger" data-remove="${i}" aria-label="Remove">×</button>
+    </li>`).join('');
+  $('#purchase-empty').classList.toggle('hidden', purchase.lines.length > 0);
+  const total = purchaseTotal();
+  const paid = Math.min(toPaise($('#purchase-paid').value), total);
+  $('#purchase-total').textContent = rupees(total);
+  $('#purchase-due').textContent = total - paid > 0
+    ? `${rupees(total - paid)} will be added to what you owe ${purchase.supplier.name}.`
+    : total ? 'Fully paid.' : '';
+  $('#purchase-save').disabled = purchase.lines.length === 0;
+}
+
+$('#purchase-lines').onclick = (e) => {
+  const i = e.target.dataset.remove;
+  if (i === undefined) return;
+  purchase.lines.splice(Number(i), 1);
+  savePurchaseDraft();
+  renderPurchase();
+};
+$('#purchase-paid').oninput = renderPurchase;
+$('#purchase-discard').onclick = () => {
+  if (!confirm('Discard this supplier bill?')) return;
+  purchase = { supplier: null, lines: [] };
+  $('#purchase-invoice').value = '';
+  $('#purchase-paid').value = 0;
+  afterSupplierChange();
+};
+
+$('#purchase-save').onclick = async (e) => {
+  const btn = e.currentTarget;
+  const s = purchase.supplier;
+  const total = purchaseTotal();
+  const paid = toPaise($('#purchase-paid').value);
+  if (paid > total) return toast('Paid amount is more than the bill total', true);
+  const body = {
+    ...(s.id ? { supplier_id: s.id } : { supplier_name: s.name, supplier_phone: s.phone || undefined }),
+    invoice_no: $('#purchase-invoice').value.trim() || undefined,
+    items: purchase.lines.map((l) => ({
+      barcode: l.barcode, quantity: l.quantity, unit_cost: l.unit_cost,
+      ...(l.isNew && { name: l.name, price: l.price, gst_rate: l.gst_rate, low_stock: l.low_stock }),
+    })),
+    paid,
+    payment_method: $('input[name=pmethod]:checked').value,
+    client_id: newClientId(),
+  };
+  const due = total - paid;
+  const done = (msg) => {
+    toast(msg);
+    purchase = { supplier: null, lines: [] };
+    $('#purchase-invoice').value = '';
+    $('#purchase-paid').value = 0;
+    afterSupplierChange();
+  };
+
+  btn.disabled = true;
+  try {
+    if ((await getOutbox()).length) await trySync();
+    await api('/purchases', { method: 'POST', body });
+    await refreshCatalog();
+    await cachedGet('/suppliers').catch(() => {});
+    done(`Purchase saved — ${due > 0 ? `${rupees(due)} added to ${s.name}'s dues` : 'fully paid'}`);
+  } catch (err) {
+    if (!err.offline) {
+      btn.disabled = false;
+      return toast(err.message, true);
+    }
+    await enqueue({
+      kind: 'purchase', path: '/purchases',
+      body: { ...body, created_at: new Date().toISOString() },
+      label: `Purchase ${rupees(total)} from ${s.name}`,
+      preview: { total, paid },
+    });
+    for (const l of purchase.lines) {
+      if (l.isNew) {
+        await catalogUpsert({ id: null, barcode: l.barcode, name: l.name, price: l.price, cost: l.unit_cost,
+          gst_rate: l.gst_rate, low_stock: l.low_stock, quantity: l.quantity });
+      } else {
+        await catalogChangeQty(l.barcode, l.quantity);
+      }
+    }
+    done('Purchase saved offline — will sync when internet is back');
+  }
+};
 
 async function startStockIn(barcode) {
   stockForm.reset();
@@ -437,14 +580,26 @@ async function startStockIn(barcode) {
   } catch (err) {
     return toast(err.message, true);
   }
+  // A new product already scanned onto this bill doesn't need its details asked again.
+  const draft = purchase.lines.find((l) => l.barcode === barcode);
+  if (!stockProduct && draft) stockProduct = { name: draft.name, price: draft.price, cost: draft.unit_cost, quantity: 0, draft: true };
+
   const isNew = !stockProduct;
+  const buying = inPurchase();
   stockForm.dataset.mode = isNew ? 'new' : 'existing';
   $('.new-only', stockForm).classList.toggle('hidden', !isNew);
+  $('.quick-only', stockForm).classList.toggle('hidden', buying);
+  $('.purchase-only', stockForm).classList.toggle('hidden', !buying);
   stockForm.name.required = stockForm.price.required = isNew;
+  stockForm.unit_cost.required = buying;
+  if (buying && stockProduct?.cost) stockForm.unit_cost.value = stockProduct.cost / 100;
+  $('#stock-submit').textContent = buying ? 'Add to bill' : 'Add to stock';
   $('#stock-title').textContent = isNew ? 'New product' : stockProduct.name;
   $('#stock-current').textContent = isNew
     ? `Barcode ${barcode} — enter details once, next time it's one scan.`
-    : `Barcode ${barcode} · ${rupees(stockProduct.price)} · ${stockProduct.quantity} in stock${stockProduct.cached ? ' (saved copy)' : ''}`;
+    : stockProduct.draft
+      ? `Barcode ${barcode} · already on this bill`
+      : `Barcode ${barcode} · ${rupees(stockProduct.price)} · ${stockProduct.quantity} in stock${stockProduct.cached ? ' (saved copy)' : ''}`;
   stockForm.classList.remove('hidden');
   $('#stock-hint').classList.add('hidden');
   (isNew ? stockForm.name : stockForm.quantity).focus();
@@ -456,10 +611,31 @@ function closeStockForm() {
   $('#stock-hint').classList.remove('hidden');
 }
 
+function addPurchaseLine(f) {
+  const quantity = parseInt(f.quantity.value, 10);
+  const unit_cost = toPaise(f.unit_cost.value);
+  const barcode = f.barcode.value;
+  const line = purchase.lines.find((l) => l.barcode === barcode);
+  if (line) {
+    line.quantity += quantity;
+    line.unit_cost = unit_cost;
+  } else {
+    purchase.lines.push(f.dataset.mode === 'new'
+      ? { barcode, quantity, unit_cost, isNew: true, name: f.name.value.trim(), price: toPaise(f.price.value),
+          gst_rate: Number(f.gst_rate.value), low_stock: parseInt(f.low_stock.value, 10) || 0 }
+      : { barcode, quantity, unit_cost, isNew: false, name: stockProduct.name });
+  }
+  savePurchaseDraft();
+  renderPurchase();
+  toast(`${line?.name ?? purchase.lines.at(-1).name} ×${quantity} added to bill`);
+  closeStockForm();
+}
+
 $('#stock-cancel').onclick = closeStockForm;
 stockForm.onsubmit = async (e) => {
   e.preventDefault();
   const f = stockForm;
+  if (inPurchase()) return addPurchaseLine(f);
   const body = { barcode: f.barcode.value, quantity: parseInt(f.quantity.value, 10), client_id: newClientId() };
   if (f.dataset.mode === 'new') {
     Object.assign(body, {
@@ -587,42 +763,71 @@ async function editProduct(id) {
   };
 }
 
-// --- udhaar khata -------------------------------------------------------
+// --- khata: udhaar from customers, dues to suppliers --------------------
+
+const SIDES = {
+  customer: {
+    path: '/customers', noun: 'customer', totalLabel: 'Total udhaar outstanding', add: '+ Add customer / opening balance',
+    none: 'No pending udhaar. 🎉', empty: 'No customers yet.', openingLabel: 'Already owes you (from your old khata) ₹',
+    methods: ['cash', 'upi', 'card'], payLabel: 'Payment received ₹', payKind: 'payment',
+    types: { opening: 'Opening balance', credit_sale: 'Udhaar bill', payment: 'Payment received' },
+    paidMsg: (amount, name) => `Recorded ${amount} from ${name}`,
+  },
+  supplier: {
+    path: '/suppliers', noun: 'supplier', totalLabel: 'Total you owe suppliers', add: '+ Add supplier / opening balance',
+    none: 'Nothing owed to suppliers.', empty: 'No suppliers yet. Pick "New supplier" in Stock in when a delivery arrives.',
+    openingLabel: 'You already owe them ₹', methods: ['cash', 'upi', 'bank', 'cheque'], payLabel: 'Amount paid ₹',
+    payKind: 'supplier_payment',
+    types: { opening: 'Opening balance', purchase: 'Purchase bill', payment: 'Paid' },
+    paidMsg: (amount, name) => `Recorded ${amount} paid to ${name}`,
+  },
+};
+let khataSide = 'customer';
+
+const sameParty = (party, name, phone) =>
+  party.phone && phone ? digits(phone) === party.phone : !phone && name?.toLowerCase() === party.name.toLowerCase();
 
 // Balance changes that are queued on this phone but not on the server yet.
-async function pendingBalanceDelta(customer) {
+async function pendingBalanceDelta(side, party) {
   let delta = 0;
   for (const e of await getOutbox()) {
     if (e.error) continue;
-    if (e.kind === 'payment' && e.customer_id === customer.id) delta -= e.body.amount;
-    if (e.kind === 'sale' && e.body.payment_method === 'credit') {
-      const samePhone = customer.phone && digits(e.body.customer_phone) === customer.phone;
-      const sameName = !e.body.customer_phone && e.body.customer_name?.toLowerCase() === customer.name.toLowerCase();
-      if (samePhone || sameName) delta += e.preview.total;
+    const b = e.body;
+    if (e.kind === SIDES[side].payKind && e.party_id === party.id) delta -= b.amount;
+    if (side === 'customer' && e.kind === 'sale' && b.payment_method === 'credit' && sameParty(party, b.customer_name, b.customer_phone)) {
+      delta += e.preview.total;
+    }
+    if (side === 'supplier' && e.kind === 'purchase'
+      && (b.supplier_id ? b.supplier_id === party.id : sameParty(party, b.supplier_name, b.supplier_phone))) {
+      delta += e.preview.total - e.preview.paid;
     }
   }
   return delta;
 }
 
-async function loadUdhaar() {
-  let customers, stale;
+async function loadKhata() {
+  const side = SIDES[khataSide];
+  let parties, stale;
   try {
-    ({ data: customers, stale } = await cachedGet('/customers'));
+    ({ data: parties, stale } = await cachedGet(side.path));
   } catch (err) {
     return toast(err.message, true);
   }
-  customers = customers ?? [];
-  for (const c of customers) c.shown = c.balance + (await pendingBalanceDelta(c));
-  fillCustomerList();
+  parties = parties ?? [];
+  for (const c of parties) c.shown = c.balance + (await pendingBalanceDelta(khataSide, c));
+  if (khataSide === 'customer') fillCustomerList();
+  else fillSupplierSelect();
 
-  const needle = $('#cust-search').value.trim().toLowerCase();
-  const dueOnly = $('#cust-due-only').checked;
-  const shown = customers
+  const needle = $('#khata-search').value.trim().toLowerCase();
+  const dueOnly = $('#khata-due-only').checked;
+  const shown = parties
     .filter((c) => !needle || c.name.toLowerCase().includes(needle) || (c.phone ?? '').includes(needle))
     .filter((c) => !dueOnly || c.shown > 0)
     .sort((a, b) => b.shown - a.shown);
-  $('#udhaar-total').textContent = rupees(customers.reduce((s, c) => s + Math.max(c.shown, 0), 0));
-  $('#cust-list').innerHTML = (stale ? OFFLINE_NOTE : '') + (shown.length
+  $('#khata-total').textContent = rupees(parties.reduce((s, c) => s + Math.max(c.shown, 0), 0));
+  $('#khata-total-label').textContent = side.totalLabel;
+  $('#add-party').textContent = side.add;
+  $('#khata-list').innerHTML = (stale ? OFFLINE_NOTE : '') + (shown.length
     ? shown.map((c) => `
       <li class="tap" data-id="${c.id}">
         <div class="grow">
@@ -631,86 +836,113 @@ async function loadUdhaar() {
         </div>
         <span class="${c.shown > 0 ? 'amount-due' : 'amount-clear'}">${c.shown > 0 ? rupees(c.shown) : 'Clear'}</span>
       </li>`).join('')
-    : `<p class="empty">${dueOnly ? 'No pending udhaar. 🎉' : 'No customers yet.'}</p>`);
+    : `<p class="empty">${dueOnly && parties.length ? side.none : side.empty}</p>`);
 }
 
-let custTimer;
-$('#cust-search').oninput = () => {
-  clearTimeout(custTimer);
-  custTimer = setTimeout(loadUdhaar, 250);
+$('#khata-side').onclick = (e) => {
+  const btn = e.target.closest('button[data-side]');
+  if (!btn) return;
+  khataSide = btn.dataset.side;
+  $('#khata-side').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+  loadKhata();
 };
-$('#cust-due-only').onchange = loadUdhaar;
-$('#cust-list').onclick = (e) => {
+let khataTimer;
+$('#khata-search').oninput = () => {
+  clearTimeout(khataTimer);
+  khataTimer = setTimeout(loadKhata, 250);
+};
+$('#khata-due-only').onchange = loadKhata;
+$('#khata-list').onclick = (e) => {
   const li = e.target.closest('li[data-id]');
-  if (li) openCustomer(Number(li.dataset.id));
+  if (li) openParty(khataSide, Number(li.dataset.id));
 };
+$('#add-party').onclick = () => partyForm(khataSide, { allowOffline: false }, () => loadKhata());
 
-$('#add-customer').onclick = () => {
+// Add a customer or supplier. Offline, a supplier can still be used on a purchase:
+// it is created on the server when that purchase syncs.
+function partyForm(sideKey, { allowOffline }, onDone) {
+  const side = SIDES[sideKey];
   openModal(`
-    <form id="cust-form">
-      <h2>Add customer</h2>
+    <form id="party-form">
+      <h2>Add ${side.noun}</h2>
       <label>Name<input name="name" required autocomplete="off"></label>
       <label>Phone<input name="phone" inputmode="tel" autocomplete="off"></label>
-      <label>Already owes (from your old khata) ₹<input name="opening" type="number" min="0" step="0.01" inputmode="decimal" value="0"></label>
+      ${sideKey === 'supplier' ? '<label>GSTIN (optional)<input name="gstin" autocomplete="off"></label>' : ''}
+      <label>${side.openingLabel}<input name="opening" type="number" min="0" step="0.01" inputmode="decimal" value="0"></label>
       <div class="actions">
         <button class="btn ghost" type="button" data-close>Cancel</button>
         <button class="btn primary">Save</button>
       </div>
     </form>`);
-  const form = $('#cust-form');
-  $('[data-close]', form).onclick = () => modal.close();
+  const form = $('#party-form');
+  $('[data-close]', form).onclick = () => {
+    modal.close();
+    onDone(null);
+  };
   form.onsubmit = async (e) => {
     e.preventDefault();
+    const body = {
+      name: form.name.value.trim(),
+      phone: form.phone.value.trim() || undefined,
+      gstin: form.gstin?.value.trim() || undefined,
+      opening_balance: toPaise(form.opening.value),
+    };
     try {
-      await api('/customers', {
-        method: 'POST',
-        body: { name: form.name.value, phone: form.phone.value || undefined, opening_balance: toPaise(form.opening.value) },
-      });
+      const party = await api(side.path, { method: 'POST', body });
+      await cachedGet(side.path).catch(() => {});
       modal.close();
-      toast('Customer added');
-      loadUdhaar();
+      toast(`${party.name} added`);
+      onDone(party);
     } catch (err) {
-      toast(err.offline ? 'Adding a customer needs internet — or just bill them on udhaar' : err.message, true);
+      if (!err.offline) return toast(err.message, true);
+      if (!allowOffline) return toast(`Adding a ${side.noun} needs internet`, true);
+      if (body.opening_balance) return toast('Opening balance needs internet — set it to 0 for now', true);
+      modal.close();
+      toast(`${body.name} will be created when this purchase syncs`);
+      onDone({ id: null, name: body.name, phone: body.phone });
     }
   };
-};
+}
 
-async function openCustomer(id) {
+async function openParty(sideKey, id) {
+  const side = SIDES[sideKey];
   let c, offline = false;
   try {
-    c = await api(`/customers/${id}`);
+    c = await api(`${side.path}/${id}`);
   } catch (err) {
     if (!err.offline) return toast(err.message, true);
-    c = (await savedCustomers()).find((x) => x.id === id);
+    c = ((await kvGet('get:' + side.path)) ?? []).find((x) => x.id === id);
     if (!c) return;
     offline = true;
   }
-  const balance = c.balance + (await pendingBalanceDelta(c));
-  const TYPE = { opening: 'Opening balance', credit_sale: 'Udhaar bill', payment: 'Payment received' };
+  const balance = c.balance + (await pendingBalanceDelta(sideKey, c));
+  const invoices = Object.fromEntries((c.purchases ?? []).map((p) => [p.id, p.invoice_no]));
   const reminder = `Hello ${c.name}, this is a reminder from ${SHOP_NAME} that ${rupees(balance)} is due. Thank you!`;
+  const contact = !c.phone || balance <= 0 ? ''
+    : sideKey === 'customer'
+      ? `<a class="btn" href="${whatsappLink(c.phone, reminder)}" target="_blank" rel="noopener">Remind</a>`
+      : `<a class="btn" href="tel:${esc(c.phone)}">Call</a>`;
   openModal(`
     <form id="pay-form">
       <h2>${esc(c.name)}</h2>
-      <p class="muted">${c.phone ? esc(c.phone) : 'No phone'}</p>
-      <div class="row total"><span>Balance due</span><strong class="${balance > 0 ? 'amount-due' : ''}">${rupees(balance)}</strong></div>
+      <p class="muted">${c.phone ? esc(c.phone) : 'No phone'}${c.gstin ? ' · GSTIN ' + esc(c.gstin) : ''}</p>
+      <div class="row total"><span>${sideKey === 'customer' ? 'Balance due' : 'You owe'}</span><strong class="${balance > 0 ? 'amount-due' : ''}">${rupees(balance)}</strong></div>
       ${balance !== c.balance ? '<p class="muted">Includes entries waiting to sync.</p>' : ''}
       ${balance > 0 ? `
-        <label>Payment received ₹<input name="amount" type="number" min="0.01" step="0.01" inputmode="decimal" value="${balance / 100}" required></label>
-        <div class="pay-methods">
-          <label><input type="radio" name="method" value="cash" checked> Cash</label>
-          <label><input type="radio" name="method" value="upi"> UPI</label>
-          <label><input type="radio" name="method" value="card"> Card</label>
+        <label>${side.payLabel}<input name="amount" type="number" min="0.01" step="0.01" inputmode="decimal" value="${balance / 100}" required></label>
+        <div class="pay-methods">${side.methods.map((m, i) => `
+          <label><input type="radio" name="method" value="${m}"${i ? '' : ' checked'}> ${PAY_LABEL[m]}</label>`).join('')}
         </div>` : ''}
       <div class="actions">
         <button class="btn ghost" type="button" data-close>Close</button>
-        ${c.phone && balance > 0 ? `<a class="btn" href="${whatsappLink(c.phone, reminder)}" target="_blank" rel="noopener">Remind</a>` : ''}
+        ${contact}
         ${balance > 0 ? '<button class="btn primary">Record payment</button>' : ''}
       </div>
       <h2>Khata</h2>
       ${offline ? '<p class="notice">Offline — full history shows when the internet is back.</p>' : ''}
       <ul class="list">${(c.entries ?? []).map((e) => `
         <li><div class="grow">
-          <div>${TYPE[e.type]}${e.sale_id ? ` · Bill #${e.sale_id}` : ''}${e.method ? ` · ${PAY_LABEL[e.method]}` : ''}</div>
+          <div>${side.types[e.type]}${e.sale_id ? ` · Bill #${e.sale_id}` : ''}${e.purchase_id && e.type === 'purchase' ? ` · ${invoices[e.purchase_id] ? 'Invoice ' + esc(invoices[e.purchase_id]) : 'Purchase #' + e.purchase_id}` : ''}${e.method ? ` · ${PAY_LABEL[e.method]}` : ''}</div>
           <div class="sub">${localTime(e.created_at)}${e.note ? ' · ' + esc(e.note) : ''}</div></div>
           <strong class="${e.type === 'payment' ? 'amount-clear' : 'amount-due'}">${e.type === 'payment' ? '−' : '+'}${rupees(e.amount)}</strong>
         </li>`).join('')}</ul>
@@ -720,23 +952,24 @@ async function openCustomer(id) {
   form.onsubmit = async (e) => {
     e.preventDefault();
     const amount = toPaise(form.amount.value);
-    if (amount > balance) return toast(`${c.name} owes only ${rupees(balance)}`, true);
+    if (amount > balance) return toast(`Balance is only ${rupees(balance)}`, true);
+    const path = `${side.path}/${id}/payments`;
     const body = { amount, method: form.method.value, client_id: newClientId() };
     try {
       if ((await getOutbox()).length) await trySync();
-      await api(`/customers/${id}/payments`, { method: 'POST', body });
-      toast(`Recorded ${rupees(amount)} from ${c.name}`);
+      await api(path, { method: 'POST', body });
+      toast(side.paidMsg(rupees(amount), c.name));
     } catch (err) {
       if (!err.offline) return toast(err.message, true);
       await enqueue({
-        kind: 'payment', customer_id: id, path: `/customers/${id}/payments`,
+        kind: side.payKind, party_id: id, path,
         body: { ...body, created_at: new Date().toISOString() },
-        label: `Payment ${rupees(amount)} from ${c.name}`,
+        label: `${sideKey === 'customer' ? 'Payment from' : 'Payment to'} ${c.name} ${rupees(amount)}`,
       });
       toast('Payment saved offline — will sync later');
     }
     modal.close();
-    loadUdhaar();
+    loadKhata();
   };
 }
 
@@ -763,10 +996,11 @@ async function loadSales() {
   $('#summary').innerHTML = (stale ? OFFLINE_NOTE : '') + (s ? `
     <div><strong>${rupees(s.revenue + pendingTotal)}</strong><span>Today's sales${pending.length ? ' (incl. offline)' : ''}</span></div>
     <div><strong>${s.bills + pending.length}</strong><span>Bills today</span></div>
-    <div><strong>${rupees(s.udhaar_due)}</strong><span>Udhaar outstanding</span></div>
+    <div><strong>${rupees(s.udhaar_due)}</strong><span>Customers owe you</span></div>
+    <div><strong>${rupees(s.supplier_due ?? 0)}</strong><span>You owe suppliers</span></div>
     <div><strong>${rupees(s.stock_value)}</strong><span>Stock value (${s.units} units)</span></div>
     <div><strong>${s.low_stock}</strong><span>Low-stock items</span></div>
-    <div><strong>${pending.length}</strong><span>Bills waiting to sync</span></div>` : '');
+    ${pending.length ? `<div><strong>${pending.length}</strong><span>Bills waiting to sync</span></div>` : ''}` : '');
   const rows = [
     ...pending.map((e, i) => ({ ...e.preview, pendingIndex: i })).reverse(),
     ...sales,
@@ -798,7 +1032,7 @@ $('#sales-list').onclick = async (e) => {
 
 // --- navigation ---------------------------------------------------------
 
-const onShow = { inventory: loadInventory, udhaar: loadUdhaar, sales: loadSales };
+const onShow = { stock: fillSupplierSelect, inventory: loadInventory, khata: loadKhata, sales: loadSales };
 let currentView = 'bill';
 function refreshCurrentView() {
   onShow[currentView]?.();
@@ -828,6 +1062,7 @@ $('#shop-status').onclick = () => {
   }
 };
 renderCart();
+renderPurchase();
 renderSyncStatus();
 
 // Warm the offline copies: catalog for scanning, customers for udhaar suggestions.
@@ -835,7 +1070,11 @@ renderSyncStatus();
   await trySync();
   await refreshCatalog();
   await cachedGet('/customers').catch(() => {});
+  await cachedGet('/suppliers').catch(() => {});
   fillCustomerList();
+  purchase = (await kvGet('purchase-draft')) ?? purchase;
+  fillSupplierSelect();
+  renderPurchase();
 })();
 
 if ('serviceWorker' in navigator) {

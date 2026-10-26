@@ -174,3 +174,10 @@ a.btn { text-decoration: none; text-align: center; }
 .amount-clear { color: var(--muted); white-space: nowrap; }
 .pending { border-style: dashed !important; }
 .notice { background: #fef3c7; color: #78350f; border-radius: 8px; padding: 8px 12px; font-size: 14px; margin: 8px 0; }
+.supplier-bar { margin: 0 0 10px; }
+.segmented { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin-bottom: 10px;
+  background: var(--line); border-radius: 10px; }
+.segmented button { font: inherit; font-size: 14px; font-weight: 600; border: 0; border-radius: 8px; padding: 8px 4px;
+  background: transparent; color: var(--muted); cursor: pointer; }
+.segmented button.active { background: var(--card); color: var(--text); }
+.remove { width: 34px; height: 34px; padding: 0; }

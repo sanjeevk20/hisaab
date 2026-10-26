@@ -6,9 +6,11 @@ A phone-first web app for kirana / small retail shops:
 - **Bill** — scan items into a cart, apply a discount, pick Cash / UPI / Card / Udhaar, complete the sale. Sold quantities are **removed from stock automatically** in the same database transaction as the bill. If any item is short, nothing is written.
 - **Receipt** — print it, or send it to the customer on WhatsApp.
 - **Inventory** — search, low-stock filter, edit prices, correct stock (damage, recount), and see a full history of every stock movement.
+- **Supplier purchases** — when a delivery arrives, pick the supplier on *Stock in* and scan each item on their bill with its cost price. Saving the purchase adds everything to stock, updates cost prices, and records the invoice number and how much you paid now (cash / UPI / bank / cheque). The unpaid part goes on that supplier's account. The bill in progress is saved on the phone, so closing the app won't lose it.
 - **Udhaar khata** — choose *Udhaar* at checkout and the bill goes on the customer's account (matched by phone, or by name for regulars). See who owes what, record full or part payments (cash / UPI / card), send a WhatsApp reminder, and carry over balances from your paper khata as an opening balance.
-- **Works offline** — the app opens without internet, scanning works from a saved copy of your products, and bills, stock-ins and udhaar payments are saved on the phone and synced automatically when the connection returns.
-- **Sales** — today's revenue, bill count, udhaar outstanding, stock value, low-stock count, and recent bills.
+- **Supplier dues** — the *Khata* tab has two sides: *Customers owe you* and *You owe suppliers*. For each supplier: what you owe, every purchase bill and payment, record a payment, call them.
+- **Works offline** — the app opens without internet, scanning works from a saved copy of your products, and bills, stock-ins, purchases and payments are saved on the phone and synced automatically when the connection returns.
+- **Sales** — today's revenue, bill count, what customers owe you, what you owe suppliers, stock value, low-stock count, and recent bills.
 
 Products are never deleted when they sell out — they drop to 0 and show as *Out of stock*, so the next restock is still a single scan and past bills stay intact.
 
@@ -47,12 +49,12 @@ Scanning uses the native `BarcodeDetector` on Android Chrome and falls back to [
 
 - A service worker keeps the app itself (and the iPhone scanning library) cached, so it opens with no signal.
 - The product catalog and customer list are saved on the phone (IndexedDB) and refreshed whenever you're online.
-- Without internet, **bills, stock-ins and udhaar payments go into a queue** on the phone. A chip in the header shows `Offline · N pending`; tap it to see the queue or *Sync now*. The queue is sent in order as soon as the connection returns (and every 30 seconds while anything is pending).
+- Without internet, **bills, stock-ins, supplier purchases and payments (both directions) go into a queue** on the phone. A chip in the header shows `Offline · N pending`; tap it to see the queue or *Sync now*. The queue is sent in order as soon as the connection returns (and every 30 seconds while anything is pending).
 - **No double entries:** every queued action has a unique `client_id`. If a request reached the server but the reply was lost, the retry is recognised and ignored.
 - **Bills keep their real time** — offline bills are recorded with the time they were made, not the time they synced.
 - **Stock conflicts:** if another device sold the same stock while this one was offline, the offline sale is still accepted (the goods already left the shop). Stock stops at 0 and the shortfall is logged in the product's history as *"please recount"*. Online checkouts still refuse to oversell.
 - If the server rejects a queued entry (for example, invalid data), it stays in the queue marked *Rejected* with the reason, so you can retry or discard it. It is never silently dropped.
-- Needs internet: editing products, stock corrections, adding a customer by hand (you can still bill a new customer on udhaar offline), and opening old bills.
+- Needs internet: editing products, stock corrections, adding a customer or supplier from the Khata tab, opening balances, and opening old bills. You can still bill a new customer on udhaar offline, or add a new supplier on the Stock in tab; they are created when the entry syncs.
 
 Using more than one phone? Each phone syncs to the same server, so stock and khata stay shared.
 
@@ -74,13 +76,19 @@ All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills 
 | `POST /api/customers` | `{name, phone?, opening_balance?}` | Add customer (opening balance from a paper khata) |
 | `GET /api/customers/:id` | | Customer, balance and khata entries |
 | `POST /api/customers/:id/payments` | `{amount, method?, note?, client_id?, created_at?}` | Record an udhaar payment (can't exceed the balance) |
+| `GET /api/suppliers` | `?q=`, `?due=1` | Suppliers with what you owe them, largest first |
+| `POST /api/suppliers` | `{name, phone?, gstin?, opening_balance?}` | Add supplier (opening balance = what you already owe) |
+| `GET /api/suppliers/:id` | | Supplier, balance, khata entries and recent purchases |
+| `POST /api/suppliers/:id/payments` | `{amount, method?: cash\|upi\|bank\|cheque, note?, client_id?, created_at?}` | Record a payment to the supplier (can't exceed what you owe) |
+| `POST /api/purchases` | `{supplier_id \| supplier_name + supplier_phone?, invoice_no?, items:[{barcode, quantity, unit_cost, name?, price?, gst_rate?, low_stock?}], paid?, payment_method?, note?, client_id?, created_at?}` | Supplier bill: adds stock, sets cost prices, creates new products (name + price required) and the supplier if new; `total − paid` goes on their khata. All-or-nothing |
+| `GET /api/purchases`, `GET /api/purchases/:id` | `?supplier_id=&limit=` | Purchase bills |
 | `GET /api/sales`, `GET /api/sales/:id` | `?from=&to=&limit=` | Bills |
 | `GET /api/summary` | `?since=YYYY-MM-DD HH:MM:SS` (UTC) | Dashboard numbers |
 
 ## Layout
 
 ```
-server/db.js      schema, migrations + data access (SQLite, transactions, stock ledger, udhaar khata)
+server/db.js      schema, migrations + data access (SQLite, transactions, stock ledger, customer & supplier khata, purchases)
 server/app.js     JSON API + static hosting
 server/index.js   entry point (HTTP/HTTPS)
 public/           mobile web app (no build step)
@@ -92,7 +100,7 @@ test/             API tests (node:test)
 ## Possible next steps
 
 - Multi-user logins and roles (owner vs. cashier), multiple shops
-- Purchase entries with supplier and invoice, supplier dues
+- Purchase returns / damaged goods back to supplier; supplier-wise purchase reports
 - Full GST invoices (GSTIN, HSN codes, CGST/SGST split), thermal printer support
 - Product lookup from a public barcode catalog; SMS reminders for udhaar
 - Native app wrapper (Capacitor) if Play Store distribution is needed

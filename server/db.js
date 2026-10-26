@@ -75,12 +75,62 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS suppliers (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT NOT NULL,
+  phone       TEXT,
+  gstin       TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- A supplier's bill. Its lines add stock; total - paid goes on the supplier's khata.
+CREATE TABLE IF NOT EXISTS purchases (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  supplier_id     INTEGER NOT NULL REFERENCES suppliers(id),
+  invoice_no      TEXT,
+  total           INTEGER NOT NULL,
+  paid            INTEGER NOT NULL DEFAULT 0,
+  payment_method  TEXT,
+  note            TEXT,
+  client_id       TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS purchase_items (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  purchase_id  INTEGER NOT NULL REFERENCES purchases(id),
+  product_id   INTEGER NOT NULL REFERENCES products(id),
+  barcode      TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  quantity     INTEGER NOT NULL CHECK (quantity > 0),
+  unit_cost    INTEGER NOT NULL,
+  line_total   INTEGER NOT NULL
+);
+
+-- What the shop owes each supplier. Same shape as ledger_entries, the other way round.
+CREATE TABLE IF NOT EXISTS supplier_ledger (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  supplier_id  INTEGER NOT NULL REFERENCES suppliers(id),
+  type         TEXT NOT NULL CHECK (type IN ('opening', 'purchase', 'payment')),
+  amount       INTEGER NOT NULL CHECK (amount > 0),
+  purchase_id  INTEGER REFERENCES purchases(id),
+  method       TEXT,
+  note         TEXT,
+  client_id    TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_movements_product ON stock_movements(product_id);
 CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
 CREATE INDEX IF NOT EXISTS idx_ledger_customer ON ledger_entries(customer_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone) WHERE phone IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_client ON ledger_entries(client_id) WHERE client_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_phone ON suppliers(phone) WHERE phone IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_purchases_client ON purchases(client_id) WHERE client_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_ledger_client ON supplier_ledger(client_id) WHERE client_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id);
+CREATE INDEX IF NOT EXISTS idx_supplier_ledger_supplier ON supplier_ledger(supplier_id);
 `;
 
 // Columns added after the first release; applied to existing databases on open.
@@ -89,12 +139,24 @@ const MIGRATIONS = [
   // client_id lets an offline device retry the same action without it being recorded twice.
   ['sales', 'client_id', 'TEXT'],
   ['stock_movements', 'client_id', 'TEXT'],
+  ['stock_movements', 'purchase_id', 'INTEGER REFERENCES purchases(id)'],
 ];
 const POST_MIGRATION = `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_client ON sales(client_id) WHERE client_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_movements_client ON stock_movements(client_id) WHERE client_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
 `;
+
+const PARTIES = {
+  customer: {
+    table: 'customers', ledger: 'ledger_entries', fk: 'customer_id', label: 'customer', Label: 'Customer',
+    owes: (name) => `${name} owes`,
+  },
+  supplier: {
+    table: 'suppliers', ledger: 'supplier_ledger', fk: 'supplier_id', label: 'supplier', Label: 'Supplier',
+    owes: (name) => `You owe ${name}`,
+  },
+};
 
 const BALANCE_SQL = `COALESCE(SUM(CASE WHEN l.type = 'payment' THEN -l.amount ELSE l.amount END), 0)`;
 
@@ -229,11 +291,26 @@ class Store {
       .all(productId);
   }
 
-  // --- customers & udhaar -----------------------------------------------
+  // --- khata: customers (they owe us) and suppliers (we owe them) -------
 
-  listCustomers({ q, dueOnly } = {}) {
+  listCustomers(opts) { return this.#listParties(PARTIES.customer, opts); }
+  getCustomer(id) { return this.#getParty(PARTIES.customer, id); }
+  getCustomerByPhone(phone) { return this.#partyByPhone(PARTIES.customer, phone); }
+  createCustomer(fields) { return this.#createParty(PARTIES.customer, fields); }
+  recordPayment(id, payment) { return this.#recordPartyPayment(PARTIES.customer, id, payment); }
+
+  listSuppliers(opts) { return this.#listParties(PARTIES.supplier, opts); }
+  createSupplier(fields) { return this.#createParty(PARTIES.supplier, fields); }
+  recordSupplierPayment(id, payment) { return this.#recordPartyPayment(PARTIES.supplier, id, payment); }
+  getSupplier(id) {
+    const s = this.#getParty(PARTIES.supplier, id);
+    if (s) s.purchases = this.db.prepare('SELECT * FROM purchases WHERE supplier_id = ? ORDER BY created_at DESC, id DESC LIMIT 50').all(id);
+    return s;
+  }
+
+  #listParties(P, { q, dueOnly } = {}) {
     let sql = `SELECT c.*, ${BALANCE_SQL} AS balance, MAX(l.created_at) AS last_activity
-               FROM customers c LEFT JOIN ledger_entries l ON l.customer_id = c.id WHERE 1=1`;
+               FROM ${P.table} c LEFT JOIN ${P.ledger} l ON l.${P.fk} = c.id WHERE 1=1`;
     const params = [];
     if (q) {
       sql += ' AND (c.name LIKE ? OR c.phone LIKE ?)';
@@ -245,83 +322,172 @@ class Store {
     return this.db.prepare(sql).all(...params);
   }
 
-  getCustomer(id) {
+  #getParty(P, id) {
     const c = this.db
       .prepare(
-        `SELECT c.*, ${BALANCE_SQL} AS balance FROM customers c
-         LEFT JOIN ledger_entries l ON l.customer_id = c.id WHERE c.id = ? GROUP BY c.id`
+        `SELECT c.*, ${BALANCE_SQL} AS balance FROM ${P.table} c
+         LEFT JOIN ${P.ledger} l ON l.${P.fk} = c.id WHERE c.id = ? GROUP BY c.id`
       )
       .get(id);
     if (!c) return null;
     c.entries = this.db
-      .prepare('SELECT * FROM ledger_entries WHERE customer_id = ? ORDER BY created_at DESC, id DESC LIMIT 200')
+      .prepare(`SELECT * FROM ${P.ledger} WHERE ${P.fk} = ? ORDER BY created_at DESC, id DESC LIMIT 200`)
       .all(id);
     return c;
   }
 
-  getCustomerByPhone(phone) {
+  #partyByPhone(P, phone) {
     const p = normalizePhone(phone);
-    return p ? this.db.prepare('SELECT * FROM customers WHERE phone = ?').get(p) : undefined;
+    return p ? this.db.prepare(`SELECT * FROM ${P.table} WHERE phone = ?`).get(p) : undefined;
   }
 
-  createCustomer({ name, phone = null, opening_balance = 0, note = null }) {
+  #createParty(P, { name, phone = null, gstin = null, opening_balance = 0, note = null }) {
     phone = normalizePhone(phone);
-    if (phone && this.getCustomerByPhone(phone)) throw new HttpError(409, 'A customer with this phone already exists');
+    if (phone && this.#partyByPhone(P, phone)) throw new HttpError(409, `A ${P.label} with this phone already exists`);
     return this.transaction(() => {
-      const { lastInsertRowid: id } = this.db
-        .prepare('INSERT INTO customers (name, phone) VALUES (?, ?)')
-        .run(name, phone);
+      const id = this.#insertParty(P, name, phone, gstin);
       if (opening_balance > 0) {
         this.db
-          .prepare("INSERT INTO ledger_entries (customer_id, type, amount, note) VALUES (?, 'opening', ?, ?)")
+          .prepare(`INSERT INTO ${P.ledger} (${P.fk}, type, amount, note) VALUES (?, 'opening', ?, ?)`)
           .run(id, opening_balance, note ?? 'Opening balance');
       }
-      return this.getCustomer(id);
+      return P === PARTIES.supplier ? this.getSupplier(id) : this.getCustomer(id);
     });
+  }
+
+  #insertParty(P, name, phone, gstin = null) {
+    const { lastInsertRowid } = P === PARTIES.supplier
+      ? this.db.prepare('INSERT INTO suppliers (name, phone, gstin) VALUES (?, ?, ?)').run(name, phone, gstin)
+      : this.db.prepare('INSERT INTO customers (name, phone) VALUES (?, ?)').run(name, phone);
+    return lastInsertRowid;
   }
 
   // Find by id or phone; create when a name is given and no match exists.
-  #resolveCustomer({ customer_id, customer_name, customer_phone }, { create }) {
-    if (customer_id) {
-      const c = this.db.prepare('SELECT * FROM customers WHERE id = ?').get(customer_id);
-      if (!c) throw new HttpError(404, 'Customer not found');
+  #resolveParty(P, { id, name, phone }, { create }) {
+    if (id) {
+      const c = this.db.prepare(`SELECT * FROM ${P.table} WHERE id = ?`).get(id);
+      if (!c) throw new HttpError(404, `${P.Label} not found`);
       return c;
     }
-    const existing = this.getCustomerByPhone(customer_phone);
+    const existing = this.#partyByPhone(P, phone);
     if (existing) return existing;
     // Regulars are often known by name alone; match on name when no phone is given.
-    if (!normalizePhone(customer_phone) && customer_name) {
-      const byName = this.db.prepare('SELECT * FROM customers WHERE name = ? COLLATE NOCASE').all(customer_name);
+    if (!normalizePhone(phone) && name) {
+      const byName = this.db.prepare(`SELECT * FROM ${P.table} WHERE name = ? COLLATE NOCASE`).all(name);
       if (byName.length === 1) return byName[0];
-      if (byName.length > 1) throw new HttpError(409, `More than one customer is called ${customer_name} — add their phone number`);
+      if (byName.length > 1) throw new HttpError(409, `More than one ${P.label} is called ${name} — add their phone number`);
     }
     if (!create) return null;
-    if (!customer_name) throw new HttpError(400, 'Udhaar needs a customer name');
-    const { lastInsertRowid: id } = this.db
-      .prepare('INSERT INTO customers (name, phone) VALUES (?, ?)')
-      .run(customer_name, normalizePhone(customer_phone));
-    return this.db.prepare('SELECT * FROM customers WHERE id = ?').get(id);
+    if (!name) throw new HttpError(400, `${P.Label} name is required`);
+    const newId = this.#insertParty(P, name, normalizePhone(phone));
+    return this.db.prepare(`SELECT * FROM ${P.table} WHERE id = ?`).get(newId);
   }
 
-  recordPayment(customerId, { amount, method = 'cash', note = null, client_id = null, created_at = null }) {
+  #recordPartyPayment(P, partyId, { amount, method = 'cash', note = null, client_id = null, created_at = null }) {
+    const get = (id) => (P === PARTIES.supplier ? this.getSupplier(id) : this.getCustomer(id));
     return this.transaction(() => {
       if (client_id) {
-        const seen = this.db.prepare('SELECT customer_id FROM ledger_entries WHERE client_id = ?').get(client_id);
-        if (seen) return { duplicate: true, customer: this.getCustomer(seen.customer_id) };
+        const seen = this.db.prepare(`SELECT ${P.fk} AS id FROM ${P.ledger} WHERE client_id = ?`).get(client_id);
+        if (seen) return { duplicate: true, party: get(seen.id) };
       }
-      const customer = this.getCustomer(customerId);
-      if (!customer) throw new HttpError(404, 'Customer not found');
-      if (amount > customer.balance) {
-        throw new HttpError(409, `${customer.name} owes only ₹${(customer.balance / 100).toFixed(2)}`);
+      const party = get(partyId);
+      if (!party) throw new HttpError(404, `${P.Label} not found`);
+      if (amount > party.balance) {
+        throw new HttpError(409, `${P.owes(party.name)} only ₹${(party.balance / 100).toFixed(2)}`);
       }
       this.db
         .prepare(
-          `INSERT INTO ledger_entries (customer_id, type, amount, method, note, client_id, created_at)
+          `INSERT INTO ${P.ledger} (${P.fk}, type, amount, method, note, client_id, created_at)
            VALUES (?, 'payment', ?, ?, ?, ?, COALESCE(?, datetime('now')))`
         )
-        .run(customerId, amount, method, note, client_id, created_at);
-      return { duplicate: false, customer: this.getCustomer(customerId) };
+        .run(partyId, amount, method, note, client_id, created_at);
+      return { duplicate: false, party: get(partyId) };
     });
+  }
+
+  // --- supplier purchases -----------------------------------------------
+
+  // Records a supplier bill: adds every line to stock (creating new products on the way),
+  // updates each product's cost price, and puts the unpaid part on the supplier's khata.
+  // items: [{ barcode, quantity, unit_cost, name?, price?, gst_rate?, low_stock? }]
+  createPurchase({
+    supplier_id = null, supplier_name = null, supplier_phone = null, invoice_no = null, items,
+    paid = 0, payment_method = 'cash', note = null, client_id = null, created_at = null,
+  }) {
+    return this.transaction(() => {
+      if (client_id) {
+        const seen = this.db.prepare('SELECT id FROM purchases WHERE client_id = ?').get(client_id);
+        if (seen) return { ...this.getPurchase(seen.id), duplicate: true };
+      }
+      const supplier = this.#resolveParty(
+        PARTIES.supplier, { id: supplier_id, name: supplier_name, phone: supplier_phone }, { create: true }
+      );
+      const total = items.reduce((s, i) => s + i.quantity * i.unit_cost, 0);
+      if (paid > total) throw new HttpError(400, 'Paid amount cannot exceed the bill total');
+
+      const { lastInsertRowid: purchaseId } = this.db
+        .prepare(
+          `INSERT INTO purchases (supplier_id, invoice_no, total, paid, payment_method, note, client_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+        )
+        .run(supplier.id, invoice_no, total, paid, payment_method, note, client_id, created_at);
+
+      const insertItem = this.db.prepare(
+        `INSERT INTO purchase_items (purchase_id, product_id, barcode, name, quantity, unit_cost, line_total)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const item of items) {
+        let p = this.getByBarcode(item.barcode);
+        if (!p) {
+          if (!item.name || item.price === undefined) {
+            throw new HttpError(400, `New product ${item.barcode} needs a name and selling price`);
+          }
+          const { lastInsertRowid } = this.db
+            .prepare('INSERT INTO products (barcode, name, price, cost, gst_rate, low_stock) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(item.barcode, item.name, item.price, item.unit_cost, item.gst_rate ?? 0, item.low_stock ?? 5);
+          p = this.getProduct(lastInsertRowid);
+        }
+        this.db
+          .prepare("UPDATE products SET quantity = quantity + ?, cost = ?, updated_at = datetime('now') WHERE id = ?")
+          .run(item.quantity, item.unit_cost, p.id);
+        this.db
+          .prepare(
+            `INSERT INTO stock_movements (product_id, change, reason, purchase_id, note)
+             VALUES (?, ?, 'stock_in', ?, ?)`
+          )
+          .run(p.id, item.quantity, purchaseId, `Purchase from ${supplier.name}`);
+        insertItem.run(purchaseId, p.id, p.barcode, p.name, item.quantity, item.unit_cost, item.quantity * item.unit_cost);
+      }
+
+      const ledger = this.db.prepare(
+        `INSERT INTO supplier_ledger (supplier_id, type, amount, purchase_id, method, created_at)
+         VALUES (?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+      );
+      if (total > 0) ledger.run(supplier.id, 'purchase', total, purchaseId, null, created_at);
+      if (paid > 0) ledger.run(supplier.id, 'payment', paid, purchaseId, payment_method, created_at);
+      return { ...this.getPurchase(purchaseId), duplicate: false };
+    });
+  }
+
+  getPurchase(id) {
+    const p = this.db
+      .prepare('SELECT p.*, s.name AS supplier_name FROM purchases p JOIN suppliers s ON s.id = p.supplier_id WHERE p.id = ?')
+      .get(id);
+    if (!p) return null;
+    p.items = this.db.prepare('SELECT * FROM purchase_items WHERE purchase_id = ? ORDER BY id').all(id);
+    return p;
+  }
+
+  listPurchases({ supplierId, limit = 50 } = {}) {
+    let sql = 'SELECT p.*, s.name AS supplier_name FROM purchases p JOIN suppliers s ON s.id = p.supplier_id';
+    const params = [];
+    if (supplierId) {
+      sql += ' WHERE p.supplier_id = ?';
+      params.push(supplierId);
+    }
+    sql += ' ORDER BY p.created_at DESC, p.id DESC LIMIT ?';
+    params.push(limit);
+    return this.db.prepare(sql).all(...params);
   }
 
   // --- sales ------------------------------------------------------------
@@ -368,7 +534,9 @@ class Store {
       }, 0);
 
       const credit = payment_method === 'credit';
-      const customer = this.#resolveCustomer({ customer_id, customer_name, customer_phone }, { create: credit });
+      const customer = this.#resolveParty(
+        PARTIES.customer, { id: customer_id, name: customer_name, phone: customer_phone }, { create: credit }
+      );
       if (credit && !customer) throw new HttpError(400, 'Udhaar needs a customer name');
 
       const { lastInsertRowid: saleId } = this.db
@@ -453,7 +621,10 @@ class Store {
     const { udhaar_due } = this.db
       .prepare(`SELECT ${BALANCE_SQL} AS udhaar_due FROM ledger_entries l`)
       .get();
-    return { ...sales, ...stock, udhaar_due };
+    const { supplier_due } = this.db
+      .prepare(`SELECT ${BALANCE_SQL} AS supplier_due FROM supplier_ledger l`)
+      .get();
+    return { ...sales, ...stock, udhaar_due, supplier_due };
   }
 
   #move(productId, change, reason, saleId, note, clientId = null) {
