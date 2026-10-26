@@ -29,7 +29,8 @@ A new shop starts without logins. Open **Settings → Set up owner login** (6–
 | Seeing their own bills and today's own sales | ✓ | ✓ (own only) |
 | Cost prices, profit, supplier dues, all reports, GSTR-1 | ✓ | — (cost prices are never sent to a cashier's phone) |
 | Adding products, changing prices, stock corrections | ✓ | — |
-| Customer returns and refunds, purchases, suppliers, supplier returns | ✓ | — |
+| Customer returns and refunds | ✓ | Within the owner's limits (below) |
+| Purchases, suppliers, supplier returns | ✓ | — |
 | Opening balances, settings, people, backups, change log | ✓ | — |
 
 - **Who did what:** every bill, credit note, purchase, return, payment, stock movement and edit records who did it. Owners see it on bills ("Billed by Ravi"), in the bill list and in the change log.
@@ -39,7 +40,12 @@ A new shop starts without logins. Open **Settings → Set up owner login** (6–
 - **Sessions:** last 30 days from last use. *Settings → Switch user* signs out. Before it does, anything the current person did offline must sync, so it's recorded under their name. Their cached data is then wiped from the phone.
 - **Offline:** a signed-in phone keeps working offline. Signing in, switching user and managing people need the internet.
 
-Returns and refunds are owner-only on purpose: unsupervised refunds are the most common way money goes missing at a counter.
+**Cashier returns.** By default only the owner can take returns, because unsupervised refunds are the most common way money goes missing at a counter. To let cashiers take them, set limits in **Settings → Cashier returns**:
+- **Most per return** (e.g. ₹500). Set it to 0 to keep returns owner-only.
+- **Most per cashier per day** (optional cap across all their returns).
+- **Bill no older than** N days (default 7).
+
+A cashier's return must be against a bill: they type the number on the customer's receipt, or tap ↩ Return on it. The app shows their limits and what's left today, and refuses anything over the limit before money changes hands. The server checks the same limits inside the same database step that saves the return, so even two returns at the same moment can't go past the daily cap together. Every return records who took it.
 
 ## GST compliance (regular registration)
 
@@ -150,6 +156,7 @@ Once logins are set up, every endpoint except `health`, `auth/status`, `auth/log
 | `GET /api/purchase-returns`, `GET /api/purchase-returns/:id` | `?supplier_id=&limit=` | Returns |
 | `GET /api/reports/suppliers` | `?from=&to=` (UTC, `to` exclusive; default this month), `&format=csv` | Per-supplier bills, purchased, returned, net, paid, refunded, balance, last purchase, with totals |
 | `GET /api/reports/suppliers/:id` | same | One supplier: summary, items bought (qty, amount, avg cost, returned), purchases and returns |
+| `GET /api/sales/by-number/:number` | | Find a bill by the number on the receipt (invoice number or `#id`) |
 | `GET /api/sales`, `GET /api/sales/:id` | `?from=&to=&limit=` | Bills; a single bill includes `returnable` (per line: what can still come back and its `unit_refund`) and earlier `returns` |
 | `POST /api/sale-returns` | `{note_no?, sale_id?, items:[{barcode, quantity}], refund_method?: cash\|upi\|card\|khata, restock?, reason?, customer_id? \| customer_name? + customer_phone?, client_id?, created_at?}` | Customer return. With `sale_id`: refund what was paid, capped at what's left on the bill. `khata` takes it off udhaar (customer from the bill, or given). `restock: false` for damaged goods |
 | `GET /api/sale-returns`, `GET /api/sale-returns/:id` | `?sale_id=&limit=` | Customer returns |
@@ -157,7 +164,7 @@ Once logins are set up, every endpoint except `health`, `auth/status`, `auth/log
 | `POST /api/auth/setup` | `{name, username, pin}` | First run only: create the owner and sign in |
 | `POST /api/auth/login`, `POST /api/auth/logout` | `{username, pin, device_id?}` | → `{token, user}`; send `Authorization: Bearer <token>` afterwards |
 | `GET /api/users`, `POST /api/users`, `PATCH /api/users/:id` | `{name, username, role, pin}` / `{name?, role?, pin?, active?}` | Owner only: manage people |
-| `GET /api/settings`, `PUT /api/settings` | `{legal_name, trade_name, address, gstin, phone, email, gst_registered, hsn_digits: 4\|6, tz_offset, invoice_terms}` | Shop profile printed on invoices. Changes are audit-logged |
+| `GET /api/settings`, `PUT /api/settings` | `{legal_name, trade_name, address, gstin, phone, email, gst_registered, hsn_digits: 4\|6, tz_offset, invoice_terms, cashier_return_limit, cashier_return_daily_limit, cashier_return_days}` | Shop profile printed on invoices. Changes are audit-logged |
 | `POST /api/devices`, `GET /api/devices/:id` | `{name?}` | Register a device's own invoice series; get its last used numbers |
 | `POST /api/documents/void` | `{number, reason?}` | Report a device-allocated number that will never be issued |
 | `GET /api/reports/gstr1` | `?month=2026-10`, `&section=b2b\|b2cl\|b2cs\|cdnr\|cdnur\|hsn_b2b\|hsn_b2c\|docs&format=csv` | GSTR-1 tables for the month (shop's local time) |
@@ -184,7 +191,7 @@ test/             API tests (node:test)
 ## Possible next steps
 
 - Multi-user logins and roles (owner vs. cashier), multiple shops
-- Optional cashier permissions (e.g. allow returns up to a limit); encrypted off-site backups
+- Encrypted off-site backups
 - Purchase-side GST (supplier invoice details for ITC and GSTR-2B matching); GSTR-3B worksheet
 - Reorder suggestions from sales speed and low stock; slow-moving / dead stock report
 - Full GST invoices (GSTIN, HSN codes, CGST/SGST split), thermal printer support

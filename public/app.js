@@ -36,6 +36,8 @@ function toast(msg, isError = false) {
 let me = null;
 let loginsOn = false;
 const isOwner = () => !me || me.role === 'owner';
+// Cashiers take returns only when the owner has set a limit for them.
+const canReturn = () => isOwner() || shop.cashier_return_limit > 0;
 const authHeader = () => {
   const token = localStorage.getItem('hisaab.token');
   return token ? { authorization: `Bearer ${token}` } : {};
@@ -82,10 +84,11 @@ async function signedIn(token, user) {
 
 function applyRole() {
   document.body.dataset.role = isOwner() ? 'owner' : 'cashier';
+  $('#bill-mode').classList.toggle('hidden', !canReturn());
+  if (!canReturn() && billMode === 'return') setBillMode('sale');
   $('#shop-status').textContent = `${shopName()}${me ? ' · ' + me.name : ''}`;
   if (!isOwner()) {
     // Leave any owner-only screen a cashier can't use.
-    setBillMode('sale');
     reportSide = 'sales';
     khataSide = 'customer';
     if (inPurchase()) purchase = emptyPurchase();
@@ -126,6 +129,7 @@ async function loadShop() {
   if (data) shop = data;
   $('#shop-status').textContent = `${shopName()}${me ? ' · ' + me.name : ''}`;
   $('#tax-details').classList.toggle('hidden', !gstOn());
+  $('#bill-mode').classList.toggle('hidden', !canReturn());
   $('#place-of-supply').value = shop.state_code;
 }
 
@@ -621,7 +625,7 @@ function showReceipt(sale) {
   openModal(`${body}
     <div class="actions">
       <button class="btn ghost" data-close>Close</button>
-      ${sale.id && isOwner() ? '<button class="btn" data-return>↩ Return</button>' : ''}
+      ${sale.id && canReturn() ? '<button class="btn" data-return>↩ Return</button>' : ''}
       <button class="btn" data-print>Print</button>
       <a class="btn primary" href="${whatsappLink(sale.customer_phone, receiptText(sale))}" target="_blank" rel="noopener">WhatsApp</a>
     </div>`);
@@ -670,7 +674,10 @@ function setBillMode(mode) {
   $('#return-panel').classList.toggle('hidden', !isReturn);
   for (const sel of ['#cart', '#cart-empty', '#checkout']) $(sel).classList.toggle('hidden', isReturn);
   $('[data-manual=bill] button').textContent = isReturn ? 'Return' : 'Add';
-  if (isReturn) renderReturn();
+  if (isReturn) {
+    renderReturn();
+    loadReturnAllowance();
+  }
   else renderCart();
 }
 $('#bill-mode').onclick = (e) => {
@@ -689,10 +696,43 @@ function resetReturn() {
   renderReturn();
 }
 
+// A cashier's return limits and what's left of today's allowance (from the server).
+let allowance = null;
+async function loadReturnAllowance() {
+  const note = $('#return-limit');
+  if (isOwner()) {
+    allowance = null;
+    return note.classList.add('hidden');
+  }
+  try {
+    allowance = (await api('/summary')).returns;
+    await kvSet('return-allowance', allowance);
+  } catch {
+    allowance = (await kvGet('return-allowance')) ?? null;
+  }
+  if (!allowance) return note.classList.add('hidden');
+  note.textContent = `You can refund up to ${rupees(allowance.per_return)} per return`
+    + (allowance.daily ? ` · ${rupees(allowance.left_today)} left today` : '')
+    + ` · bills up to ${allowance.days} day${allowance.days === 1 ? '' : 's'} old. Bigger returns need the owner.`;
+  note.classList.remove('hidden');
+}
+
+// Same rules as the server, so a cashier finds out before handing over money.
+function cashierReturnProblem(total) {
+  if (isOwner() || !allowance) return null;
+  if (!ret.sale) return "Load the customer's bill — cashiers can only take returns against a bill";
+  if (total > allowance.per_return) return `Returns over ${rupees(allowance.per_return)} need the owner`;
+  if (allowance.daily && total > allowance.left_today) return `Only ${rupees(allowance.left_today)} of returns left for you today — ask the owner`;
+  const age = Math.round((Date.parse(localDate(nowSql(), shop.tz_offset)) - Date.parse(localDate(ret.sale.created_at, shop.tz_offset))) / 86_400_000);
+  if (age > allowance.days) return `This bill is ${age} days old — returns after ${allowance.days} days need the owner`;
+  return null;
+}
+
+// id: the bill's id, or the number printed on the receipt.
 async function loadReturnBill(id) {
   let sale;
   try {
-    sale = await api(`/sales/${id}`);
+    sale = await api(typeof id === 'number' ? `/sales/${id}` : `/sales/by-number/${encodeURIComponent(id)}`);
   } catch (err) {
     return toast(err.offline ? 'Loading a bill needs internet — you can still scan items without it' : err.message, true);
   }
@@ -703,7 +743,7 @@ async function loadReturnBill(id) {
       gst_rate: l.gst_rate, hsn: l.hsn, unit: l.unit,
     }])),
   };
-  $('#return-bill-form').bill.value = sale.id;
+  $('#return-bill-form').bill.value = sale.invoice_no ?? sale.id;
   // Refund the way they paid; an udhaar bill comes off the udhaar.
   const method = sale.payment_method === 'credit' ? 'khata' : sale.payment_method;
   $(`input[name=refund][value=${method}]`).checked = true;
@@ -712,16 +752,17 @@ async function loadReturnBill(id) {
 
 $('#return-bill-form').onsubmit = (e) => {
   e.preventDefault();
-  const id = parseInt(e.target.bill.value, 10);
-  if (id) loadReturnBill(id);
+  const number = e.target.bill.value.trim();
+  if (number) loadReturnBill(number);
   else resetReturn();
 };
 
 async function addToReturn(barcode) {
   if (!ret.sale && gstOn()) return toast('Load the bill first — a credit note must refer to the original invoice', true);
+  if (!ret.sale && !isOwner()) return toast("Load the customer's bill first — cashiers can only take returns against a bill", true);
   if (ret.sale) {
     const line = ret.lines.get(barcode);
-    if (!line) return toast(`That item is not on bill #${ret.sale.id}`, true);
+    if (!line) return toast(`That item is not on bill ${ret.sale.invoice_no ?? '#' + ret.sale.id}`, true);
     if (line.quantity >= line.max) return toast(`Only ${line.max} of ${line.name} can come back from this bill`, true);
     line.quantity++;
     toast(`${line.name} ×${line.quantity} to return`);
@@ -745,7 +786,7 @@ function renderReturn() {
   const s = ret.sale;
   const lines = [...ret.lines.values()];
   $('#return-bill-info').textContent = s
-    ? `Bill #${s.id} · ${localTime(s.created_at)} · ${rupees(s.total)} · ${PAY_LABEL[s.payment_method]}${s.customer_name ? ' · ' + s.customer_name : ''}`
+    ? `${s.invoice_no ?? `Bill #${s.id}`} · ${localTime(s.created_at)} · ${rupees(s.total)} · ${PAY_LABEL[s.payment_method]}${s.customer_name ? ' · ' + s.customer_name : ''}`
       + (s.returns.length ? ` · already returned ${rupees(s.returns.reduce((t, r) => t + r.total, 0))}` : '')
     : '';
   $('#return-lines').innerHTML = lines.map((l) => `
@@ -796,6 +837,8 @@ $('#return-save').onclick = async (e) => {
   if (needsCustomer && !customer_name && !customer_phone) return toast('Enter the customer whose udhaar this comes off', true);
   const total = lines.reduce((t, l) => t + l.unit_price * l.quantity, 0);
   if (gstOn() && !ret.sale) return toast('Load the bill first — a credit note must refer to the original invoice', true);
+  const limitProblem = cashierReturnProblem(total);
+  if (limitProblem) return toast(limitProblem, true);
   btn.disabled = true;
   let note_no;
   try {
@@ -846,6 +889,7 @@ $('#return-save').onclick = async (e) => {
     const note = await api('/sale-returns', { method: 'POST', body });
     if (refund_method === 'khata') cachedGet('/customers').then(fillCustomerList, () => {});
     await finish(false, note);
+    loadReturnAllowance();
   } catch (err) {
     if (!err.offline) {
       voidNumber(note_no, `Not issued: ${err.message}`);
@@ -1633,8 +1677,10 @@ async function loadSales() {
   const pending = (await getOutbox()).filter((e) => e.kind === 'sale');
   const pendingTotal = pending.reduce((sum, e) => sum + e.preview.total, 0);
   $('#summary').innerHTML = (stale ? OFFLINE_NOTE : '') + (s?.own ? `
-    <div><strong>${rupees(s.revenue - s.refunds + pendingTotal)}</strong><span>Your sales today${pending.length ? ' (incl. offline)' : ''}</span></div>
-    <div><strong>${s.bills + pending.length}</strong><span>Your bills today</span></div>` : s ? `
+    <div><strong>${rupees(s.revenue + pendingTotal)}</strong><span>Your sales today${pending.length ? ' (incl. offline)' : ''}</span></div>
+    <div><strong>${s.bills + pending.length}</strong><span>Your bills today</span></div>
+    ${s.returns ? `<div><strong>${rupees(s.refunds)}</strong><span>Your refunds today</span></div>
+      <div><strong>${s.returns.daily ? rupees(s.returns.left_today) : '—'}</strong><span>Returns you can still take today${s.returns.daily ? '' : ' (no daily cap)'}</span></div>` : ''}` : s ? `
     <div><strong>${rupees(s.revenue - (s.refunds ?? 0) + pendingTotal)}</strong><span>Today's sales${s.refunds ? `, after ${rupees(s.refunds)} returns` : ''}${pending.length ? ' (incl. offline)' : ''}</span></div>
     <div><strong>${s.bills + pending.length}</strong><span>Bills today</span></div>
     <div><strong>${rupees(s.udhaar_due)}</strong><span>Customers owe you</span></div>
@@ -1996,6 +2042,15 @@ async function openSettings() {
           <option value="6" ${shop.hsn_digits === 6 ? 'selected' : ''}>Above ₹5 crore — 6-digit HSN on every invoice</option>
         </select></label>
       <label>Terms printed on invoices (optional)<input name="invoice_terms" value="${esc(shop.invoice_terms)}" placeholder="e.g. Goods once sold will be exchanged within 7 days"></label>
+      <div class="settings-section">
+        <h2>Cashier returns</h2>
+        <p class="muted">Let cashiers take customer returns against a bill, up to these limits. Anything bigger needs you. Set the first to 0 to keep returns owner-only.</p>
+        <div class="grid2">
+          <label>Most per return ₹<input name="ret_limit" type="number" min="0" step="1" inputmode="numeric" value="${shop.cashier_return_limit / 100}"></label>
+          <label>Most per cashier per day ₹ <span class="muted">(0 = no cap)</span><input name="ret_daily" type="number" min="0" step="1" inputmode="numeric" value="${shop.cashier_return_daily_limit / 100}"></label>
+          <label>Bill no older than (days)<input name="ret_days" type="number" min="0" max="365" step="1" inputmode="numeric" value="${shop.cashier_return_days}"></label>
+        </div>
+      </div>
       <div class="actions">
         <button class="btn ghost" type="button" data-close>Close</button>
         <button class="btn primary">Save</button>
@@ -2029,6 +2084,8 @@ async function openSettings() {
           trade_name: form.trade_name.value.trim(), address: form.address.value.trim() || undefined,
           phone: form.phone.value.trim(), email: form.email.value.trim(),
           hsn_digits: Number(form.hsn_digits.value), invoice_terms: form.invoice_terms.value.trim(),
+          cashier_return_limit: toPaise(form.ret_limit.value), cashier_return_daily_limit: toPaise(form.ret_daily.value),
+          cashier_return_days: parseInt(form.ret_days.value, 10) || 0,
         },
       });
       await kvSet('get:/settings', shop);
@@ -2105,7 +2162,7 @@ async function openPeople() {
       <label>PIN (cashier 4–12 digits, owner 6–12)<input name="pin" type="password" inputmode="numeric" required autocomplete="new-password"></label>
       <button class="btn primary wide">Add</button>
     </form>
-    <p class="muted">A cashier can bill, take udhaar and payments, add customers and restock. They can't see cost prices, profit, suppliers or reports, take returns, or change prices and settings.</p>
+    <p class="muted">A cashier can bill, take udhaar and payments, add customers, restock, and take returns within the limits in Settings. They can't see cost prices, profit, suppliers or reports, or change prices and settings.</p>
     <div class="actions"><button class="btn ghost" data-close>Close</button></div>`);
   $('[data-close]', modal).onclick = () => modal.close();
   const form = $('#person-form');

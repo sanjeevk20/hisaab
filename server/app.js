@@ -192,8 +192,9 @@ function userFields(body, { partial, role }) {
 }
 
 // What a cashier may do: bill, take udhaar and payments, add customers, restock existing products,
-// and see their own bills. Everything else (prices and costs, purchases, suppliers, returns and
-// refunds, reports, settings, users, backups) is the owner's. Anything not listed is refused.
+// see their own bills, and take returns within the owner's limits. Everything else (prices and
+// costs, purchases, suppliers, reports, settings, users, backups) is the owner's. Anything not
+// listed is refused.
 const CASHIER_ALLOWED = [
   ['GET', /^\/api\/settings$/],
   ['GET', /^\/api\/products$/],
@@ -207,10 +208,13 @@ const CASHIER_ALLOWED = [
   ['POST', /^\/api\/sales$/],
   ['GET', /^\/api\/sales$/],
   ['GET', /^\/api\/sales\/\d+$/],
+  ['GET', /^\/api\/sales\/by-number\/.+$/],
   ['GET', /^\/api\/summary$/],
   ['POST', /^\/api\/devices$/],
   ['GET', /^\/api\/devices\/\d+$/],
   ['POST', /^\/api\/documents\/void$/],
+  // Returns, within the owner's limits (checked when the return is saved).
+  ['POST', /^\/api\/sale-returns$/],
 ];
 const PUBLIC = [
   ['GET', /^\/api\/health$/],
@@ -293,6 +297,18 @@ async function serveStatic(req, res, pathname) {
 // --- routes -------------------------------------------------------------
 
 function routes(store) {
+  // A bill with what can still be returned from it. Cashiers open their own bills — or any bill,
+  // to take a return, when the owner allows cashier returns.
+  const saleDetail = (sale) => {
+    if (!sale) throw new HttpError(404, 'Bill not found');
+    if (isCashier() && sale.user_id !== currentUser().id && !store.getShop().cashier_return_limit) {
+      throw new HttpError(403, 'You can only open bills you made');
+    }
+    sale.returnable = store.returnableFromSale(sale.id);
+    sale.returns = store.listSaleReturns({ saleId: sale.id });
+    return sale;
+  };
+
   return [
     ['GET', /^\/api\/health$/, () => ({ ok: true })],
 
@@ -589,13 +605,13 @@ function routes(store) {
         userId: isCashier() ? currentUser().id : undefined,
       })],
 
-    ['GET', /^\/api\/sales\/(\d+)$/, (_req, m) => {
-      const sale = store.getSale(Number(m[1]));
-      if (!sale) throw new HttpError(404, 'Bill not found');
-      if (isCashier() && sale.user_id !== currentUser().id) throw new HttpError(403, 'You can only open bills you made');
-      sale.returnable = store.returnableFromSale(sale.id);
-      sale.returns = store.listSaleReturns({ saleId: sale.id });
-      return sale;
+    ['GET', /^\/api\/sales\/(\d+)$/, (_req, m) => saleDetail(store.getSale(Number(m[1])))],
+
+    // Find a bill by the number on the customer's receipt (invoice number, or bill id).
+    ['GET', /^\/api\/sales\/by-number\/(.+)$/, (_req, m) => {
+      const number = decodeURIComponent(m[1]).trim();
+      const sale = store.getSaleByNumber(number) ?? (/^#?\d+$/.test(number) ? store.getSale(Number(number.replace('#', ''))) : null);
+      return saleDetail(sale);
     }],
 
     ['GET', /^\/api\/sale-returns$/, (_req, _m, url) =>
@@ -670,6 +686,9 @@ function routes(store) {
         hsn_digits: int(body.hsn_digits, 'hsn_digits', { min: 4, max: 6 }),
         tz_offset: int(body.tz_offset, 'tz_offset', { min: -720, max: 840 }),
         invoice_terms: str(body.invoice_terms, 'invoice_terms', { max: 300 }),
+        cashier_return_limit: int(body.cashier_return_limit, 'cashier_return_limit', { max: 1e9 }),
+        cashier_return_daily_limit: int(body.cashier_return_daily_limit, 'cashier_return_daily_limit', { max: 1e10 }),
+        cashier_return_days: int(body.cashier_return_days, 'cashier_return_days', { min: 0, max: 365 }),
       };
       // Allow clearing text fields with an empty string.
       for (const k of ['trade_name', 'phone', 'email', 'invoice_terms', 'gstin']) if (body[k] === '') fields[k] = '';

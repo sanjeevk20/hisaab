@@ -31,7 +31,7 @@
   <main>
     <!-- Billing -->
     <section id="view-bill" class="view active">
-      <div class="segmented owner-only" id="bill-mode" role="tablist">
+      <div class="segmented" id="bill-mode" role="tablist">
         <button data-mode="sale" class="active" role="tab">New sale</button>
         <button data-mode="return" role="tab">Customer return</button>
       </div>
@@ -47,9 +47,10 @@
 
       <div id="return-panel" class="hidden">
         <form id="return-bill-form" class="manual">
-          <input name="bill" placeholder="Bill number (optional)" inputmode="numeric" autocomplete="off">
+          <input name="bill" placeholder="Bill or invoice number from the receipt" autocomplete="off" autocapitalize="characters">
           <button class="btn">Load bill</button>
         </form>
+        <p id="return-limit" class="notice hidden"></p>
         <p id="return-bill-info" class="muted"></p>
         <ul id="return-lines" class="list"></ul>
         <p id="return-empty" class="empty">Load the customer's bill, or just scan what they brought back.</p>

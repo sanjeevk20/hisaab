@@ -123,7 +123,8 @@ test('cashiers see only their own bills; everything is attributed', async () => 
   assert.equal(all.find((s) => s.id === mine[0].id).user_name, 'Ravi');
 
   const summary = (await call('/summary?since=2000-01-01 00:00:00', 'GET', null, cashier)).body;
-  assert.deepEqual(Object.keys(summary).sort(), ['bills', 'own', 'refunds', 'revenue']);
+  assert.deepEqual(Object.keys(summary).sort(), ['bills', 'own', 'refunds', 'returns', 'revenue']);
+  assert.equal(summary.returns, null, 'no return allowance until the owner sets one');
   assert.equal(summary.bills, 1);
 
   const moves = store.db.prepare("SELECT user_id FROM stock_movements WHERE reason = 'sale' ORDER BY id DESC LIMIT 2").all();

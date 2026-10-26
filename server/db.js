@@ -378,6 +378,10 @@ export const DEFAULT_SHOP = {
   hsn_digits: 4,     // 4 if last year's turnover was up to ₹5 crore, else 6 (Notification 78/2020)
   tz_offset: 330,    // minutes east of UTC; invoice dates and financial years use the shop's local time
   invoice_terms: '',
+  // Customer returns a cashier may take without the owner. 0 = cashiers can't take returns.
+  cashier_return_limit: 0,        // most a single return may refund, paise
+  cashier_return_daily_limit: 0,  // most one cashier may refund in a day, paise (0 = no daily cap)
+  cashier_return_days: 7,         // the bill must be at most this many days old
 };
 
 // Code for the n-th device series: A…Z, then AA…ZZ. '0' is the server's own series.
@@ -643,6 +647,9 @@ class Store {
         if (!shop.legal_name || !shop.address) throw new HttpError(400, 'Legal name and address are printed on every tax invoice');
       }
       if (![4, 6].includes(shop.hsn_digits)) throw new HttpError(400, 'hsn_digits must be 4 or 6');
+      if (shop.cashier_return_daily_limit && shop.cashier_return_daily_limit < shop.cashier_return_limit) {
+        throw new HttpError(400, 'The daily return limit must be at least the per-return limit');
+      }
       this.db
         .prepare("INSERT INTO settings (key, value) VALUES ('shop', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
         .run(JSON.stringify(shop));
@@ -1386,6 +1393,11 @@ class Store {
     });
   }
 
+  getSaleByNumber(number) {
+    const row = this.db.prepare('SELECT id FROM sales WHERE invoice_no = ? COLLATE NOCASE').get(number);
+    return row ? this.getSale(row.id) : null;
+  }
+
   getSale(id) {
     const sale = this.db.prepare('SELECT s.*, u.name AS user_name FROM sales s LEFT JOIN users u ON u.id = s.user_id WHERE s.id = ?').get(id);
     if (!sale) return null;
@@ -1422,7 +1434,16 @@ class Store {
     const { refunds } = this.db
       .prepare('SELECT COALESCE(SUM(total), 0) AS refunds FROM sale_returns WHERE created_at >= ? AND user_id = ?')
       .get(since, userId);
-    return { ...sales, refunds, own: true };
+    const shop = this.getShop();
+    return {
+      ...sales, refunds, own: true,
+      returns: shop.cashier_return_limit ? {
+        per_return: shop.cashier_return_limit,
+        daily: shop.cashier_return_daily_limit || null,
+        left_today: shop.cashier_return_daily_limit ? Math.max(0, shop.cashier_return_daily_limit - this.cashierRefundsToday(userId)) : null,
+        days: shop.cashier_return_days,
+      } : null,
+    };
   }
 
   summary(since) {
@@ -1527,6 +1548,7 @@ class Store {
         }
       }
       const total = lines.reduce((s, l) => s + l.unit_price * l.quantity, 0);
+      if (currentUser()?.role === 'cashier') this.#checkCashierReturn(shop, sale, total, created_at);
 
       let customer = null;
       if (sale?.customer_id) customer = this.db.prepare('SELECT * FROM customers WHERE id = ?').get(sale.customer_id);
@@ -1584,6 +1606,42 @@ class Store {
       }
       return { ...this.getSaleReturn(returnId), duplicate: false };
     });
+  }
+
+  // A cashier may take a return only against a bill, only up to the owner's limits, and only for
+  // a recent bill. Checked inside the return's transaction, so two returns at once can't both
+  // slip under the daily cap.
+  #checkCashierReturn(shop, sale, total, createdAt) {
+    const fmt = (p) => `₹${(p / 100).toLocaleString('en-IN')}`;
+    if (!shop.cashier_return_limit) throw new HttpError(403, 'Only the owner can take returns');
+    if (!sale) throw new HttpError(403, "Cashiers can only take returns against a bill — load the customer's bill");
+    if (total > shop.cashier_return_limit) {
+      throw new HttpError(403, `Returns over ${fmt(shop.cashier_return_limit)} need the owner`);
+    }
+    const now = this.localInfo(createdAt).day;
+    const billDay = localDate(sale.created_at, shop.tz_offset);
+    const ageDays = Math.round((Date.parse(now) - Date.parse(billDay)) / 86_400_000);
+    if (ageDays > shop.cashier_return_days) {
+      throw new HttpError(403, `This bill is ${ageDays} days old — returns after ${shop.cashier_return_days} days need the owner`);
+    }
+    if (shop.cashier_return_daily_limit) {
+      const user = currentUser();
+      const done = this.cashierRefundsToday(user.id, createdAt);
+      if (done + total > shop.cashier_return_daily_limit) {
+        const left = Math.max(0, shop.cashier_return_daily_limit - done);
+        throw new HttpError(403, `That would take your returns today past ${fmt(shop.cashier_return_daily_limit)} (${fmt(left)} left) — ask the owner`);
+      }
+    }
+  }
+
+  // What a cashier has refunded so far on the shop's local day.
+  cashierRefundsToday(userId, at = null) {
+    const { tz_offset } = this.getShop();
+    const day = this.localInfo(at).day;
+    const start = new Date(Date.parse(day + 'T00:00:00Z') - tz_offset * 60_000).toISOString().slice(0, 19).replace('T', ' ');
+    return this.db
+      .prepare("SELECT COALESCE(SUM(total), 0) AS t FROM sale_returns WHERE user_id = ? AND created_at >= ? AND created_at < datetime(?, '+1 day')")
+      .get(userId, start, start).t;
   }
 
   getSaleReturn(id) {
