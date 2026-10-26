@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f766e">
+  <title>Hisaab</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Hisaab</h1>
+    <button id="shop-status" class="muted shop-name" title="Change shop name"></button>
+  </header>
+
+  <main>
+    <!-- Billing -->
+    <section id="view-bill" class="view active">
+      <div class="scanner" data-scanner="bill">
+        <video playsinline muted></video>
+        <div class="scan-frame"></div>
+        <button class="scan-toggle btn">Start camera</button>
+      </div>
+      <form class="manual" data-manual="bill">
+        <input name="code" placeholder="Type or scan barcode" inputmode="numeric" autocomplete="off">
+        <button class="btn">Add</button>
+      </form>
+
+      <ul id="cart" class="list"></ul>
+      <p id="cart-empty" class="empty">Scan an item to start a bill.</p>
+
+      <div id="checkout" class="card hidden">
+        <div class="row"><span>Subtotal</span><strong id="subtotal">₹0.00</strong></div>
+        <label class="row"><span>Discount (₹)</span><input id="discount" type="number" min="0" step="0.01" value="0" inputmode="decimal"></label>
+        <div class="row total"><span>Total</span><strong id="total">₹0.00</strong></div>
+        <div class="pay-methods" role="radiogroup">
+          <label><input type="radio" name="pay" value="cash" checked> Cash</label>
+          <label><input type="radio" name="pay" value="upi"> UPI</label>
+          <label><input type="radio" name="pay" value="card"> Card</label>
+          <label><input type="radio" name="pay" value="credit"> Udhaar</label>
+        </div>
+        <input id="cust-name" placeholder="Customer name (optional)">
+        <input id="cust-phone" placeholder="Customer phone (optional)" inputmode="tel">
+        <div class="actions">
+          <button id="clear-cart" class="btn ghost" type="button">Clear</button>
+          <button id="do-checkout" class="btn primary" type="button">Complete sale</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Stock in -->
+    <section id="view-stock" class="view">
+      <div class="scanner" data-scanner="stock">
+        <video playsinline muted></video>
+        <div class="scan-frame"></div>
+        <button class="scan-toggle btn">Start camera</button>
+      </div>
+      <form class="manual" data-manual="stock">
+        <input name="code" placeholder="Type or scan barcode" inputmode="numeric" autocomplete="off">
+        <button class="btn">Look up</button>
+      </form>
+
+      <form id="stock-form" class="card hidden">
+        <h2 id="stock-title"></h2>
+        <p id="stock-current" class="muted"></p>
+        <input type="hidden" name="barcode">
+        <div class="new-only">
+          <label>Name<input name="name" required autocomplete="off"></label>
+          <div class="grid2">
+            <label>Selling price ₹<input name="price" type="number" min="0" step="0.01" inputmode="decimal" required></label>
+            <label>Cost price ₹<input name="cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
+            <label>GST %<select name="gst_rate">
+              <option value="0">0</option><option value="5">5</option><option value="12">12</option>
+              <option value="18">18</option><option value="28">28</option></select></label>
+            <label>Low-stock alert at<input name="low_stock" type="number" min="0" value="5" inputmode="numeric"></label>
+          </div>
+        </div>
+        <label>Quantity to add<input name="quantity" type="number" min="1" value="1" inputmode="numeric" required></label>
+        <div class="actions">
+          <button class="btn ghost" type="button" id="stock-cancel">Cancel</button>
+          <button class="btn primary">Add to stock</button>
+        </div>
+      </form>
+      <p class="empty" id="stock-hint">Scan a product's barcode to add it to inventory. New barcodes ask for name and price once.</p>
+    </section>
+
+    <!-- Inventory -->
+    <section id="view-inventory" class="view">
+      <div class="toolbar">
+        <input id="inv-search" type="search" placeholder="Search name or barcode">
+        <label class="chip"><input type="checkbox" id="inv-low"> Low stock</label>
+      </div>
+      <ul id="inv-list" class="list"></ul>
+    </section>
+
+    <!-- Sales -->
+    <section id="view-sales" class="view">
+      <div id="summary" class="stats"></div>
+      <h2>Recent bills</h2>
+      <ul id="sales-list" class="list"></ul>
+    </section>
+  </main>
+
+  <nav class="tabs">
+    <button data-view="bill" class="active">🧾<span>Bill</span></button>
+    <button data-view="stock">📦<span>Stock in</span></button>
+    <button data-view="inventory">📋<span>Inventory</span></button>
+    <button data-view="sales">📈<span>Sales</span></button>
+  </nav>
+
+  <dialog id="modal"><div id="modal-body"></div></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
