@@ -2,6 +2,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { currentUser } from './context.js';
 import {
   GST_RATES, STATES, UQC, financialYear, gstinValid, hsnValid, invoiceProblem, localDate, parseDocNumber, splitTax, stateLabel, taxOf,
 } from '../public/gst.js';
@@ -21,6 +23,7 @@ CREATE TABLE IF NOT EXISTS stock_movements (
   sale_return_id INTEGER REFERENCES sale_returns(id),
   note         TEXT,
   client_id    TEXT,
+  user_id      INTEGER REFERENCES users(id),
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );`;
 
@@ -37,6 +40,7 @@ CREATE TABLE IF NOT EXISTS supplier_ledger (
   method       TEXT,
   note         TEXT,
   client_id    TEXT,
+  user_id      INTEGER REFERENCES users(id),
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );`;
 
@@ -53,6 +57,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   method          TEXT,
   note            TEXT,
   client_id       TEXT,
+  user_id         INTEGER REFERENCES users(id),
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );`;
 
@@ -201,6 +206,31 @@ CREATE TABLE IF NOT EXISTS purchase_return_items (
   line_total  INTEGER NOT NULL
 );
 
+-- People who sign in. 'owner' can do everything; 'cashier' can bill, collect udhaar and restock.
+-- pin_hash is scrypt with a per-user salt; the PIN itself is never stored.
+CREATE TABLE IF NOT EXISTS users (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  name           TEXT NOT NULL,
+  username       TEXT NOT NULL UNIQUE,
+  role           TEXT NOT NULL CHECK (role IN ('owner', 'cashier')),
+  pin_hash       TEXT NOT NULL,
+  active         INTEGER NOT NULL DEFAULT 1,
+  failed_logins  INTEGER NOT NULL DEFAULT 0,
+  locked_until   TEXT,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Signed-in devices. Only a hash of the token is stored, so a copy of the database (a backup)
+-- can't be used to sign in.
+CREATE TABLE IF NOT EXISTS sessions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  token_hash  TEXT NOT NULL UNIQUE,
+  device_id   INTEGER REFERENCES devices(id),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Shop profile and preferences, one JSON value per key ('shop').
 CREATE TABLE IF NOT EXISTS settings (
   key    TEXT PRIMARY KEY,
@@ -308,6 +338,9 @@ const MIGRATIONS = [
   ['sale_return_items', 'cgst', 'INTEGER NOT NULL DEFAULT 0'],
   ['sale_return_items', 'sgst', 'INTEGER NOT NULL DEFAULT 0'],
   ['sale_return_items', 'igst', 'INTEGER NOT NULL DEFAULT 0'],
+  // Who made each entry.
+  ...['sales', 'sale_returns', 'purchases', 'purchase_returns', 'ledger_entries', 'supplier_ledger', 'stock_movements', 'audit_log']
+    .map((t) => [t, 'user_id', 'INTEGER REFERENCES users(id)']),
 ];
 const POST_MIGRATION = `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_client ON sales(client_id) WHERE client_id IS NOT NULL;
@@ -315,7 +348,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_movements_client ON stock_movements(client
 CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_invoice_no ON sales(invoice_no) WHERE invoice_no IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sale_returns_note_no ON sale_returns(note_no) WHERE note_no IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_user ON sales(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 `;
+
+export const SESSION_DAYS = 30;
+const MAX_FAILED_LOGINS = 5;
+const LOCK_MINUTES = 15;
+
+export function hashPin(pin) {
+  const salt = randomBytes(16);
+  return `scrypt$${salt.toString('hex')}$${scryptSync(pin, salt, 32).toString('hex')}`;
+}
+
+function pinMatches(pin, stored) {
+  const [, saltHex, hashHex] = stored.split('$');
+  const expected = Buffer.from(hashHex, 'hex');
+  const actual = scryptSync(String(pin), Buffer.from(saltHex, 'hex'), expected.length);
+  return timingSafeEqual(actual, expected);
+}
+
+const tokenHash = (token) => createHash('sha256').update(String(token)).digest('hex');
+const publicUser = ({ pin_hash, failed_logins, locked_until, ...u }) => ({ ...u, active: Boolean(u.active) });
+const uid = () => currentUser()?.id ?? null;
 
 export const DEFAULT_SHOP = {
   legal_name: '', trade_name: '', address: '', state_code: '', gstin: '', phone: '', email: '',
@@ -451,6 +506,119 @@ class Store {
     }
   }
 
+  // Records who made a row (the signed-in user of the current request).
+  #stamp(table, id) {
+    const user = uid();
+    if (user) this.db.prepare(`UPDATE ${table} SET user_id = ? WHERE id = ?`).run(user, id);
+  }
+
+  // --- users & sessions -------------------------------------------------
+
+  // Until the first owner is created the shop runs without logins, as before.
+  hasUsers() {
+    return Boolean(this.db.prepare('SELECT 1 FROM users LIMIT 1').get());
+  }
+
+  listUsers() {
+    return this.db.prepare('SELECT * FROM users ORDER BY active DESC, role DESC, name COLLATE NOCASE').all().map(publicUser);
+  }
+
+  getUser(id) {
+    const u = this.db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+    return u ? publicUser(u) : null;
+  }
+
+  createUser({ name, username, role, pin }) {
+    username = username.toLowerCase();
+    if (this.db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
+      throw new HttpError(409, `The username ${username} is taken`);
+    }
+    return this.transaction(() => {
+      const { lastInsertRowid: id } = this.db
+        .prepare('INSERT INTO users (name, username, role, pin_hash) VALUES (?, ?, ?, ?)')
+        .run(name, username, role, hashPin(pin));
+      this.audit('user', Number(id), 'create', { name, username, role });
+      return this.getUser(id);
+    });
+  }
+
+  // Changing a PIN or deactivating someone signs them out everywhere. The last active owner
+  // can't be removed or made a cashier, so the shop is never locked out.
+  updateUser(id, { name, role, pin, active }) {
+    return this.transaction(() => {
+      const before = this.db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+      if (!before) throw new HttpError(404, 'User not found');
+      const losingOwner = before.role === 'owner' && before.active && (role === 'cashier' || active === false);
+      if (losingOwner) {
+        const { n } = this.db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'owner' AND active = 1").get();
+        if (n <= 1) throw new HttpError(409, 'Keep at least one active owner');
+      }
+      const sets = [], params = [], changes = {};
+      for (const [k, v] of Object.entries({ name, role })) {
+        if (v !== undefined && v !== before[k]) { sets.push(`${k} = ?`); params.push(v); changes[k] = [before[k], v]; }
+      }
+      if (active !== undefined && active !== Boolean(before.active)) {
+        sets.push('active = ?'); params.push(active ? 1 : 0); changes.active = [Boolean(before.active), active];
+      }
+      if (pin !== undefined) {
+        sets.push('pin_hash = ?', 'failed_logins = 0', 'locked_until = NULL'); params.push(hashPin(pin)); changes.pin = 'changed';
+      }
+      if (sets.length) this.db.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...params, id);
+      if (pin !== undefined || active === false || role !== undefined && role !== before.role) {
+        this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+      }
+      this.audit('user', id, 'update', changes);
+      return this.getUser(id);
+    });
+  }
+
+  // Checks a username and PIN. Five wrong PINs in a row lock the account for 15 minutes.
+  login(username, pin, deviceId = null) {
+    return this.transaction(() => {
+      const u = this.db.prepare('SELECT * FROM users WHERE username = ?').get(String(username).toLowerCase());
+      const now = this.db.prepare("SELECT datetime('now') AS t").get().t;
+      if (!u || !u.active) throw new HttpError(401, 'Wrong username or PIN');
+      if (u.locked_until && u.locked_until > now) {
+        throw new HttpError(429, 'Too many wrong PINs. Try again in a few minutes, or ask the owner to reset your PIN.');
+      }
+      if (!pinMatches(pin, u.pin_hash)) {
+        const failed = u.failed_logins + 1;
+        const lock = failed >= MAX_FAILED_LOGINS;
+        this.db
+          .prepare(`UPDATE users SET failed_logins = ?, locked_until = ${lock ? `datetime('now', '+${LOCK_MINUTES} minutes')` : 'NULL'} WHERE id = ?`)
+          .run(lock ? 0 : failed, u.id);
+        this.audit('user', u.id, lock ? 'locked' : 'login_failed', null);
+        // Commit the count even though the request fails.
+        return { failed: true, locked: lock };
+      }
+      this.db.prepare('UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?').run(u.id);
+      const token = randomBytes(32).toString('base64url');
+      const known = deviceId && this.db.prepare('SELECT 1 FROM devices WHERE id = ?').get(deviceId);
+      this.db.prepare('INSERT INTO sessions (user_id, token_hash, device_id) VALUES (?, ?, ?)').run(u.id, tokenHash(token), known ? deviceId : null);
+      this.db.prepare('INSERT INTO audit_log (entity, entity_id, action, user_id) VALUES (?, ?, ?, ?)').run('user', u.id, 'login', u.id);
+      return { token, user: publicUser(u) };
+    });
+  }
+
+  // The user a session token belongs to, if it is still valid (used in the last 30 days).
+  userForToken(token) {
+    if (!token) return null;
+    const row = this.db
+      .prepare(
+        `SELECT u.*, s.id AS session_id, s.last_seen FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE s.token_hash = ? AND u.active = 1 AND s.last_seen > datetime('now', '-${SESSION_DAYS} days')`
+      )
+      .get(tokenHash(token));
+    if (!row) return null;
+    this.db.prepare("UPDATE sessions SET last_seen = datetime('now') WHERE id = ? AND last_seen < datetime('now', '-1 hour')").run(row.session_id);
+    const { session_id, last_seen, ...u } = row;
+    return publicUser(u);
+  }
+
+  logout(token) {
+    this.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash(token));
+  }
+
   // --- settings, devices, document numbers, audit ----------------------
 
   getShop() {
@@ -569,14 +737,14 @@ class Store {
   audit(entity, entityId, action, changes) {
     if (changes && typeof changes === 'object' && !Object.keys(changes).length) return;
     this.db
-      .prepare('INSERT INTO audit_log (entity, entity_id, action, changes) VALUES (?, ?, ?, ?)')
-      .run(entity, entityId, action, changes === undefined ? null : JSON.stringify(changes));
+      .prepare('INSERT INTO audit_log (entity, entity_id, action, changes, user_id) VALUES (?, ?, ?, ?, ?)')
+      .run(entity, entityId, action, changes === undefined || changes === null ? null : JSON.stringify(changes), uid());
   }
 
   listAudit({ limit = 100, entity } = {}) {
-    const rows = entity
-      ? this.db.prepare('SELECT * FROM audit_log WHERE entity = ? ORDER BY id DESC LIMIT ?').all(entity, limit)
-      : this.db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?').all(limit);
+    const sql = `SELECT a.*, u.name AS user_name FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
+                 ${entity ? 'WHERE a.entity = ?' : ''} ORDER BY a.id DESC LIMIT ?`;
+    const rows = this.db.prepare(sql).all(...(entity ? [entity, limit] : [limit]));
     return rows.map((r) => ({ ...r, changes: r.changes ? JSON.parse(r.changes) : null }));
   }
 
@@ -784,6 +952,7 @@ class Store {
            VALUES (?, 'payment', ?, ?, ?, ?, COALESCE(?, datetime('now')))`
         )
         .run(partyId, amount, method, note, client_id, created_at);
+      this.#stamp(P.ledger, this.db.prepare('SELECT last_insert_rowid() AS id').get().id);
       return { duplicate: false, party: get(partyId) };
     });
   }
@@ -814,6 +983,7 @@ class Store {
            VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
         )
         .run(supplier.id, invoice_no, total, paid, payment_method, note, client_id, created_at);
+      this.#stamp('purchases', purchaseId);
 
       const insertItem = this.db.prepare(
         `INSERT INTO purchase_items (purchase_id, product_id, barcode, name, quantity, unit_cost, line_total)
@@ -835,10 +1005,10 @@ class Store {
           .run(item.quantity, item.unit_cost, p.id);
         this.db
           .prepare(
-            `INSERT INTO stock_movements (product_id, change, reason, purchase_id, note)
-             VALUES (?, ?, 'stock_in', ?, ?)`
+            `INSERT INTO stock_movements (product_id, change, reason, purchase_id, note, user_id)
+             VALUES (?, ?, 'stock_in', ?, ?, ?)`
           )
-          .run(p.id, item.quantity, purchaseId, `Purchase from ${supplier.name}`);
+          .run(p.id, item.quantity, purchaseId, `Purchase from ${supplier.name}`, uid());
         insertItem.run(purchaseId, p.id, p.barcode, p.name, item.quantity, item.unit_cost, item.quantity * item.unit_cost);
       }
 
@@ -932,6 +1102,7 @@ class Store {
            VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
         )
         .run(supplier.id, purchase_id, total, settlement, settlement === 'refund' ? refund_method : null, reason, client_id, created_at);
+      this.#stamp('purchase_returns', returnId);
 
       const insertItem = this.db.prepare(
         `INSERT INTO purchase_return_items (return_id, product_id, barcode, name, quantity, unit_cost, line_total)
@@ -944,10 +1115,10 @@ class Store {
           .run(quantity, p.id);
         this.db
           .prepare(
-            `INSERT INTO stock_movements (product_id, change, reason, return_id, purchase_id, note)
-             VALUES (?, ?, 'purchase_return', ?, ?, ?)`
+            `INSERT INTO stock_movements (product_id, change, reason, return_id, purchase_id, note, user_id)
+             VALUES (?, ?, 'purchase_return', ?, ?, ?, ?)`
           )
-          .run(p.id, -quantity, returnId, purchase_id, `Returned to ${supplier.name}${reason ? ' — ' + reason : ''}`);
+          .run(p.id, -quantity, returnId, purchase_id, `Returned to ${supplier.name}${reason ? ' — ' + reason : ''}`, uid());
       }
 
       if (total > 0) {
@@ -1179,6 +1350,7 @@ class Store {
           customer_name ?? customer?.name ?? null, customer?.phone ?? normalizePhone(customer_phone), client_id, created_at,
           number, buyer_gstin, buyer_address, pos, interState ? 1 : 0, sum('taxable'), sum('cgst'), sum('sgst'), sum('igst')
         );
+      this.#stamp('sales', saleId);
 
       const insertItem = this.db.prepare(
         `INSERT INTO sale_items (sale_id, product_id, barcode, name, quantity, unit_price, unit_cost, gst_rate, line_total,
@@ -1215,29 +1387,44 @@ class Store {
   }
 
   getSale(id) {
-    const sale = this.db.prepare('SELECT * FROM sales WHERE id = ?').get(id);
+    const sale = this.db.prepare('SELECT s.*, u.name AS user_name FROM sales s LEFT JOIN users u ON u.id = s.user_id WHERE s.id = ?').get(id);
     if (!sale) return null;
     sale.items = this.db.prepare('SELECT * FROM sale_items WHERE sale_id = ? ORDER BY id').all(id);
     return sale;
   }
 
-  listSales({ from, to, limit = 50 } = {}) {
-    let sql = 'SELECT * FROM sales WHERE 1=1';
+  listSales({ from, to, limit = 50, userId } = {}) {
+    let sql = 'SELECT s.*, u.name AS user_name FROM sales s LEFT JOIN users u ON u.id = s.user_id WHERE 1=1';
     const params = [];
+    if (userId) {
+      sql += ' AND s.user_id = ?';
+      params.push(userId);
+    }
     if (from) {
-      sql += ' AND created_at >= ?';
+      sql += ' AND s.created_at >= ?';
       params.push(from);
     }
     if (to) {
-      sql += ' AND created_at < ?';
+      sql += ' AND s.created_at < ?';
       params.push(to);
     }
-    sql += ' ORDER BY created_at DESC, id DESC LIMIT ?';
+    sql += ' ORDER BY s.created_at DESC, s.id DESC LIMIT ?';
     params.push(limit);
     return this.db.prepare(sql).all(...params);
   }
 
   // Dashboard numbers. `since` is a UTC 'YYYY-MM-DD HH:MM:SS' string.
+  // A cashier's own bills and refunds since `since` — no stock values or dues.
+  cashierSummary(since, userId) {
+    const sales = this.db
+      .prepare('SELECT COUNT(*) AS bills, COALESCE(SUM(total), 0) AS revenue FROM sales WHERE created_at >= ? AND user_id = ?')
+      .get(since, userId);
+    const { refunds } = this.db
+      .prepare('SELECT COALESCE(SUM(total), 0) AS refunds FROM sale_returns WHERE created_at >= ? AND user_id = ?')
+      .get(since, userId);
+    return { ...sales, refunds, own: true };
+  }
+
   summary(since) {
     const sales = this.db
       .prepare('SELECT COUNT(*) AS bills, COALESCE(SUM(total), 0) AS revenue FROM sales WHERE created_at >= ?')
@@ -1364,6 +1551,7 @@ class Store {
         )
         .run(sale_id, customer?.id ?? null, total, refund_method, restock ? 1 : 0, reason, client_id, created_at,
           number, sum('taxable'), sum('cgst'), sum('sgst'), sum('igst'));
+      this.#stamp('sale_returns', returnId);
 
       const insertItem = this.db.prepare(
         `INSERT INTO sale_return_items (return_id, product_id, barcode, name, quantity, unit_price, unit_cost, gst_rate, line_total,
@@ -1380,10 +1568,10 @@ class Store {
             .run(quantity, p.id);
           this.db
             .prepare(
-              `INSERT INTO stock_movements (product_id, change, reason, sale_id, sale_return_id, note)
-               VALUES (?, ?, 'sale_return', ?, ?, ?)`
+              `INSERT INTO stock_movements (product_id, change, reason, sale_id, sale_return_id, note, user_id)
+               VALUES (?, ?, 'sale_return', ?, ?, ?, ?)`
             )
-            .run(p.id, quantity, sale_id, returnId, `Customer return${reason ? ' — ' + reason : ''}`);
+            .run(p.id, quantity, sale_id, returnId, `Customer return${reason ? ' — ' + reason : ''}`, uid());
         }
       });
       if (refund_method === 'khata' && total > 0) {
@@ -1667,8 +1855,8 @@ class Store {
   #move(productId, change, reason, saleId, note, clientId = null) {
     this.db
       .prepare(
-        'INSERT INTO stock_movements (product_id, change, reason, sale_id, note, client_id) VALUES (?, ?, ?, ?, ?, ?)'
+        'INSERT INTO stock_movements (product_id, change, reason, sale_id, note, client_id, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
       )
-      .run(productId, change, reason, saleId, note, clientId);
+      .run(productId, change, reason, saleId, note, clientId, uid());
   }
 }

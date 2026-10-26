@@ -13,13 +13,25 @@
   <header class="topbar">
     <h1>Hisaab</h1>
     <button id="sync-status" class="sync-chip hidden" title="Offline queue"></button>
-    <button id="shop-status" class="muted shop-name" title="Change shop name"></button>
+    <button id="shop-status" class="muted shop-name" title="Settings"></button>
   </header>
+
+  <!-- Sign-in, shown once logins are set up -->
+  <div id="login-screen" class="login hidden">
+    <form id="login-form" class="card" autocomplete="on">
+      <h1>Hisaab</h1>
+      <p id="login-shop" class="muted"></p>
+      <label>Username<input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+      <label>PIN<input name="pin" type="password" inputmode="numeric" pattern="\d*" autocomplete="current-password" required></label>
+      <p id="login-error" class="notice hidden"></p>
+      <button class="btn primary wide">Sign in</button>
+    </form>
+  </div>
 
   <main>
     <!-- Billing -->
     <section id="view-bill" class="view active">
-      <div class="segmented" id="bill-mode" role="tablist">
+      <div class="segmented owner-only" id="bill-mode" role="tablist">
         <button data-mode="sale" class="active" role="tab">New sale</button>
         <button data-mode="return" role="tab">Customer return</button>
       </div>
@@ -95,7 +107,7 @@
 
     <!-- Stock in -->
     <section id="view-stock" class="view">
-      <label class="supplier-bar">Supplier
+      <label class="supplier-bar owner-only">Supplier
         <select id="purchase-supplier"><option value="">Quick stock in (no supplier bill)</option></select>
       </label>
       <div class="scanner" data-scanner="stock">
@@ -187,7 +199,7 @@
 
     <!-- Khata: udhaar from customers, dues to suppliers -->
     <section id="view-khata" class="view">
-      <div class="segmented" id="khata-side" role="tablist">
+      <div class="segmented owner-only" id="khata-side" role="tablist">
         <button data-side="customer" class="active" role="tab">Customers owe you</button>
         <button data-side="supplier" role="tab">You owe suppliers</button>
       </div>
@@ -202,7 +214,7 @@
 
     <!-- Sales -->
     <section id="view-sales" class="view">
-      <div class="segmented" id="report-side" role="tablist">
+      <div class="segmented owner-only" id="report-side" role="tablist">
         <button data-side="sales" class="active" role="tab">Sales</button>
         <button data-side="profit" role="tab">Profit</button>
         <button data-side="suppliers" role="tab">Suppliers</button>

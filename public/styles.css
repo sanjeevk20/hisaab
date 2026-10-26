@@ -224,3 +224,8 @@ a.btn { text-decoration: none; text-align: center; }
 .inv-meta strong { white-space: nowrap; }
 dialog .actions { flex-wrap: wrap; }
 dialog .actions .btn { flex: 1 1 auto; }
+body[data-role="cashier"] .owner-only { display: none !important; }
+.login { position: fixed; inset: 0; z-index: 30; background: var(--bg); display: grid; place-items: center; padding: 16px; }
+.login form { width: min(100%, 360px); }
+.login h1 { margin: 0; color: var(--brand); }
+.user-row .badge.owner { background: var(--brand); color: var(--brand-ink); }

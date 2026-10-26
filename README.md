@@ -18,6 +18,29 @@ A phone-first web app for kirana / small retail shops:
 
 Products are never deleted when they sell out — they drop to 0 and show as *Out of stock*, so the next restock is still a single scan and past bills stay intact.
 
+## Owner and cashier logins
+
+A new shop starts without logins. Open **Settings → Set up owner login** (6–12 digit PIN) to protect it, then **People → Add a person** for each cashier (4–12 digit PIN). From then on every phone shows a sign-in screen, and the server checks every request.
+
+| | Owner | Cashier |
+| --- | --- | --- |
+| Billing, udhaar sales, collecting udhaar payments, adding customers | ✓ | ✓ |
+| Restocking products that already exist | ✓ | ✓ |
+| Seeing their own bills and today's own sales | ✓ | ✓ (own only) |
+| Cost prices, profit, supplier dues, all reports, GSTR-1 | ✓ | — (cost prices are never sent to a cashier's phone) |
+| Adding products, changing prices, stock corrections | ✓ | — |
+| Customer returns and refunds, purchases, suppliers, supplier returns | ✓ | — |
+| Opening balances, settings, people, backups, change log | ✓ | — |
+
+- **Who did what:** every bill, credit note, purchase, return, payment, stock movement and edit records who did it. Owners see it on bills ("Billed by Ravi"), in the bill list and in the change log.
+- **PINs:** stored only as salted scrypt hashes. Sign-in tokens are stored only as hashes, so a backup can't be used to sign in.
+- **Lockout:** five wrong PINs lock that login for 15 minutes. The owner can reset a PIN, which signs that person out everywhere.
+- **Turning a login off** signs the person out at once. The last owner can't be removed or demoted.
+- **Sessions:** last 30 days from last use. *Settings → Switch user* signs out. Before it does, anything the current person did offline must sync, so it's recorded under their name. Their cached data is then wiped from the phone.
+- **Offline:** a signed-in phone keeps working offline. Signing in, switching user and managing people need the internet.
+
+Returns and refunds are owner-only on purpose: unsupervised refunds are the most common way money goes missing at a counter.
+
 ## GST compliance (regular registration)
 
 Tap the shop name in the header → **Settings**, tick *Registered under GST (regular)*, and enter your GSTIN (the check digit is verified), legal name and address. From then on:
@@ -70,7 +93,7 @@ Data lives in `data/hisaab.db` (one SQLite file — back it up by copying it).
 | --- | --- |
 | `PORT` | Port to listen on (default 3000) |
 | `HISAAB_DB` | Path to the SQLite file |
-| `HISAAB_PIN` | If set, the app asks for this PIN before any API access |
+| `HISAAB_PIN` | Optional extra shared PIN asked before any API access (older setup; owner/cashier logins are the better option) |
 | `HTTPS_KEY`, `HTTPS_CERT` | Serve over HTTPS (needed for the camera on phones) |
 
 ## Using it on a phone
@@ -82,7 +105,7 @@ Browsers only allow the camera on `https://` pages (or `localhost`). Pick one:
    `HTTPS_KEY=certs/key.pem HTTPS_CERT=certs/cert.pem npm start`.
 3. **Deploy** to any Node host (Render, Railway, Fly.io, a VPS) — they provide HTTPS. Mount a persistent disk for `data/`.
 
-On the phone, use the browser's *Add to Home screen* to install it like an app. Set the shop name by tapping "My Shop" in the header. Set `HISAAB_PIN` whenever the server is reachable from the internet.
+On the phone, use the browser's *Add to Home screen* to install it like an app. Tap the shop name in the header for Settings. **Set up the owner login before the server is reachable from the internet**; until then anyone who can open it can do anything.
 
 Scanning uses the native `BarcodeDetector` on Android Chrome and falls back to [ZXing](https://github.com/zxing-js/library) (loaded from unpkg) on iPhone Safari and others. Supported: EAN-13/8, UPC-A/E, Code 128/39, ITF, QR. A USB/Bluetooth barcode gun also works — it types into the barcode box.
 
@@ -101,7 +124,7 @@ Using more than one phone? Each phone syncs to the same server, so stock and kha
 
 ## API
 
-All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills report the GST contained in the total. Write endpoints accept an optional `client_id`; repeating a request with the same `client_id` returns the original result instead of recording it again.
+Once logins are set up, every endpoint except `health`, `auth/status`, `auth/login` and `auth/setup` needs a signed-in user. Cashiers get `403` outside their allow-list (`CASHIER_ALLOWED` in `server/app.js`), and cost fields are removed from what they receive. All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills report the GST contained in the total. Write endpoints accept an optional `client_id`; repeating a request with the same `client_id` returns the original result instead of recording it again.
 
 | Method & path | Body / query | Does |
 | --- | --- | --- |
@@ -130,6 +153,10 @@ All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills 
 | `GET /api/sales`, `GET /api/sales/:id` | `?from=&to=&limit=` | Bills; a single bill includes `returnable` (per line: what can still come back and its `unit_refund`) and earlier `returns` |
 | `POST /api/sale-returns` | `{note_no?, sale_id?, items:[{barcode, quantity}], refund_method?: cash\|upi\|card\|khata, restock?, reason?, customer_id? \| customer_name? + customer_phone?, client_id?, created_at?}` | Customer return. With `sale_id`: refund what was paid, capped at what's left on the bill. `khata` takes it off udhaar (customer from the bill, or given). `restock: false` for damaged goods |
 | `GET /api/sale-returns`, `GET /api/sale-returns/:id` | `?sale_id=&limit=` | Customer returns |
+| `GET /api/auth/status` | | Whether logins are set up, and who the token belongs to |
+| `POST /api/auth/setup` | `{name, username, pin}` | First run only: create the owner and sign in |
+| `POST /api/auth/login`, `POST /api/auth/logout` | `{username, pin, device_id?}` | → `{token, user}`; send `Authorization: Bearer <token>` afterwards |
+| `GET /api/users`, `POST /api/users`, `PATCH /api/users/:id` | `{name, username, role, pin}` / `{name?, role?, pin?, active?}` | Owner only: manage people |
 | `GET /api/settings`, `PUT /api/settings` | `{legal_name, trade_name, address, gstin, phone, email, gst_registered, hsn_digits: 4\|6, tz_offset, invoice_terms}` | Shop profile printed on invoices. Changes are audit-logged |
 | `POST /api/devices`, `GET /api/devices/:id` | `{name?}` | Register a device's own invoice series; get its last used numbers |
 | `POST /api/documents/void` | `{number, reason?}` | Report a device-allocated number that will never be issued |
@@ -144,7 +171,8 @@ All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills 
 ```
 server/db.js      schema, migrations (incl. table rebuilds) + data access (SQLite, transactions, stock ledger, customer & supplier khata, purchases)
 server/app.js     JSON API + static hosting
-server/index.js   entry point (HTTP/HTTPS)
+server/index.js   entry point (HTTP/HTTPS, daily backups)
+server/context.js who is making the current request
 public/           mobile web app (no build step)
   gst.js          GST rules shared by server and app: GSTIN check, states, rates, tax split, numbering, FY
   invoice.js      printable tax invoice and credit note
@@ -156,7 +184,7 @@ test/             API tests (node:test)
 ## Possible next steps
 
 - Multi-user logins and roles (owner vs. cashier), multiple shops
-- Owner and cashier logins (today one shared PIN); encrypted off-site backups
+- Optional cashier permissions (e.g. allow returns up to a limit); encrypted off-site backups
 - Purchase-side GST (supplier invoice details for ITC and GSTR-2B matching); GSTR-3B worksheet
 - Reorder suggestions from sales speed and low stock; slow-moving / dead stock report
 - Full GST invoices (GSTIN, HSN codes, CGST/SGST split), thermal printer support

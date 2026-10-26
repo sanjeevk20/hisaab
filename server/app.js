@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { HttpError, GST_RATES, UQC, hsnValid } from './db.js';
 import { gstDate } from '../public/gst.js';
+import { currentUser, requestContext } from './context.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const MIME = {
@@ -167,6 +168,69 @@ const GSTR1_CSV = {
 };
 const STREAMED = Symbol('streamed'); // the route already wrote the response
 
+const isCashier = () => currentUser()?.role === 'cashier';
+
+const bearer = (req) => /^Bearer (\S+)$/.exec(req.headers.authorization ?? '')?.[1] ?? null;
+
+// PINs are 4–12 digits; owners need at least 6, as an owner login can see and change everything.
+function userFields(body, { partial, role }) {
+  const out = {
+    name: str(body.name, 'name', { required: !partial, max: 60 }),
+    username: partial ? str(body.username, 'username') : str(body.username, 'username', { required: true, max: 30 })?.toLowerCase(),
+    role: body.role === undefined && partial ? undefined : body.role ?? role,
+    pin: body.pin === undefined && partial ? undefined : str(body.pin, 'pin', { required: true, max: 12 }),
+  };
+  if (out.username !== undefined && !/^[a-z0-9._-]{2,30}$/.test(out.username)) {
+    throw new HttpError(400, 'Username: 2–30 letters, digits, dots, dashes or underscores');
+  }
+  if (out.role !== undefined && !['owner', 'cashier'].includes(out.role)) throw new HttpError(400, 'role must be owner or cashier');
+  if (out.pin !== undefined) {
+    const min = (out.role ?? role) === 'owner' ? 6 : 4;
+    if (!new RegExp(`^\\d{${min},12}$`).test(out.pin)) throw new HttpError(400, `PIN must be ${min}–12 digits`);
+  }
+  return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined));
+}
+
+// What a cashier may do: bill, take udhaar and payments, add customers, restock existing products,
+// and see their own bills. Everything else (prices and costs, purchases, suppliers, returns and
+// refunds, reports, settings, users, backups) is the owner's. Anything not listed is refused.
+const CASHIER_ALLOWED = [
+  ['GET', /^\/api\/settings$/],
+  ['GET', /^\/api\/products$/],
+  ['GET', /^\/api\/products\/barcode\/.+$/],
+  ['GET', /^\/api\/products\/\d+$/],
+  ['POST', /^\/api\/stock-in$/],
+  ['GET', /^\/api\/customers$/],
+  ['POST', /^\/api\/customers$/],
+  ['GET', /^\/api\/customers\/\d+$/],
+  ['POST', /^\/api\/customers\/\d+\/payments$/],
+  ['POST', /^\/api\/sales$/],
+  ['GET', /^\/api\/sales$/],
+  ['GET', /^\/api\/sales\/\d+$/],
+  ['GET', /^\/api\/summary$/],
+  ['POST', /^\/api\/devices$/],
+  ['GET', /^\/api\/devices\/\d+$/],
+  ['POST', /^\/api\/documents\/void$/],
+];
+const PUBLIC = [
+  ['GET', /^\/api\/health$/],
+  ['GET', /^\/api\/auth\/status$/],
+  ['POST', /^\/api\/auth\/login$/],
+  ['POST', /^\/api\/auth\/setup$/],
+];
+const ANY_USER = [['POST', /^\/api\/auth\/logout$/]];
+const listed = (list, method, path) => list.some(([m, re]) => m === method && re.test(path));
+
+// Cost prices (and so margins) are the owner's business.
+const HIDDEN_FROM_CASHIERS = new Set(['cost', 'unit_cost']);
+function stripCosts(value) {
+  if (Array.isArray(value)) return value.map(stripCosts);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).filter(([k]) => !HIDDEN_FROM_CASHIERS.has(k)).map(([k, v]) => [k, stripCosts(v)]));
+  }
+  return value;
+}
+
 function productFields(body, { partial }) {
   const fields = {
     barcode: str(body.barcode, 'barcode', { required: !partial, max: 64 }),
@@ -232,9 +296,62 @@ function routes(store) {
   return [
     ['GET', /^\/api\/health$/, () => ({ ok: true })],
 
+    // Public: whether logins are set up, and who this token belongs to.
+    ['GET', /^\/api\/auth\/status$/, () => ({ setup_required: !store.hasUsers(), user: currentUser() })],
+
+    // First run only: create the owner login. { name, username, pin, device_id? }
+    ['POST', /^\/api\/auth\/setup$/, async (req) => {
+      const body = await readJson(req);
+      const fields = userFields(body, { partial: false, role: 'owner' });
+      return store.transaction(() => {
+        if (store.hasUsers()) throw new HttpError(409, 'Logins are already set up — sign in instead');
+        store.createUser({ ...fields, role: 'owner' });
+        return [201, store.login(fields.username, fields.pin, int(body.device_id, 'device_id', { min: 1 }) ?? null)];
+      });
+    }],
+
+    // { username, pin, device_id? } → { token, user }
+    ['POST', /^\/api\/auth\/login$/, async (req) => {
+      const body = await readJson(req);
+      const result = store.login(
+        str(body.username, 'username', { required: true, max: 30 }),
+        str(body.pin, 'pin', { required: true, max: 12 }),
+        int(body.device_id, 'device_id', { min: 1 }) ?? null,
+      );
+      if (result.failed) {
+        throw new HttpError(result.locked ? 429 : 401, result.locked
+          ? 'Too many wrong PINs. Try again in 15 minutes, or ask the owner to reset your PIN.'
+          : 'Wrong username or PIN');
+      }
+      return result;
+    }],
+
+    ['POST', /^\/api\/auth\/logout$/, (req) => {
+      store.logout(bearer(req));
+      return { ok: true };
+    }],
+
+    ['GET', /^\/api\/users$/, () => store.listUsers()],
+
+    // { name, username, role: owner | cashier, pin }
+    ['POST', /^\/api\/users$/, async (req) => {
+      const fields = userFields(await readJson(req), { partial: false, role: 'cashier' });
+      return [201, store.createUser(fields)];
+    }],
+
+    // { name?, role?, pin?, active? } — a new PIN or deactivation signs the person out everywhere.
+    ['PATCH', /^\/api\/users\/(\d+)$/, async (req, m) => {
+      const body = await readJson(req);
+      const target = store.getUser(Number(m[1]));
+      if (!target) throw new HttpError(404, 'User not found');
+      const fields = userFields(body, { partial: true, role: body.role ?? target.role });
+      if ('username' in fields) throw new HttpError(400, 'Usernames cannot be changed');
+      return store.updateUser(target.id, { ...fields, active: bool(body.active, 'active') });
+    }],
+
     ['GET', /^\/api\/summary$/, (_req, _m, url) => {
       const since = url.searchParams.get('since') ?? new Date().toISOString().slice(0, 10) + ' 00:00:00';
-      return store.summary(since);
+      return isCashier() ? store.cashierSummary(since, currentUser().id) : store.summary(since);
     }],
 
     ['GET', /^\/api\/products$/, (_req, _m, url) =>
@@ -285,6 +402,7 @@ function routes(store) {
           const product = store.adjustStock(existing.id, quantity, 'stock_in', str(body.note, 'note') ?? null, clientId);
           return { created: false, product };
         }
+        if (isCashier()) throw new HttpError(403, 'Only the owner can add a new product. You can restock existing ones.');
         const product = store.createProduct(productFields({ ...body, barcode, quantity }, { partial: false }), clientId);
         return [201, { created: true, product }];
       });
@@ -296,10 +414,12 @@ function routes(store) {
     // { name, phone?, opening_balance? } — opening_balance carries over dues from a paper khata.
     ['POST', /^\/api\/customers$/, async (req) => {
       const body = await readJson(req);
+      const opening_balance = int(body.opening_balance, 'opening_balance') ?? 0;
+      if (opening_balance && isCashier()) throw new HttpError(403, 'Only the owner can enter an opening balance');
       return [201, store.createCustomer({
         name: str(body.name, 'name', { required: true }),
         phone: str(body.phone, 'phone', { max: 20 }) ?? null,
-        opening_balance: int(body.opening_balance, 'opening_balance') ?? 0,
+        opening_balance,
       })];
     }],
 
@@ -460,16 +580,19 @@ function routes(store) {
       return [purchase.duplicate ? 200 : 201, purchase];
     }],
 
+    // Cashiers see only the bills they made.
     ['GET', /^\/api\/sales$/, (_req, _m, url) =>
       store.listSales({
         from: url.searchParams.get('from') ?? undefined,
         to: url.searchParams.get('to') ?? undefined,
         limit: Math.min(Number(url.searchParams.get('limit')) || 50, 500),
+        userId: isCashier() ? currentUser().id : undefined,
       })],
 
     ['GET', /^\/api\/sales\/(\d+)$/, (_req, m) => {
       const sale = store.getSale(Number(m[1]));
       if (!sale) throw new HttpError(404, 'Bill not found');
+      if (isCashier() && sale.user_id !== currentUser().id) throw new HttpError(403, 'You can only open bills you made');
       sale.returnable = store.returnableFromSale(sale.id);
       sale.returns = store.listSaleReturns({ saleId: sale.id });
       return sale;
@@ -675,11 +798,21 @@ export function createHandler(store, { pin } = {}) {
       if (pin && url.pathname !== '/api/health' && !pinMatches(req.headers['x-hisaab-pin'], pin)) {
         throw new HttpError(401, 'Shop PIN required');
       }
+      // Logins: once an owner exists, every request needs a signed-in user, and cashiers only
+      // reach the routes listed in CASHIER_ALLOWED. Before that the shop runs open, as it did.
+      const user = store.userForToken(bearer(req));
+      if (store.hasUsers() && !listed(PUBLIC, req.method, url.pathname)) {
+        if (!user) throw Object.assign(new HttpError(401, 'Please sign in'), { extra: { login_required: true } });
+        if (user.role === 'cashier' && !listed(CASHIER_ALLOWED, req.method, url.pathname) && !listed(ANY_USER, req.method, url.pathname)) {
+          throw new HttpError(403, 'Only the owner can do this');
+        }
+      }
       for (const [method, pattern, fn] of table) {
         const m = url.pathname.match(pattern);
         if (m && req.method === method) {
-          const out = await fn(req, m, url, res);
+          let out = await requestContext.run({ user }, () => fn(req, m, url, res));
           if (out === STREAMED) return;
+          if (user?.role === 'cashier') out = stripCosts(out);
           if (out?.[CSV]) {
             res.writeHead(200, {
               'content-type': 'text/csv; charset=utf-8',
@@ -693,7 +826,7 @@ export function createHandler(store, { pin } = {}) {
       }
       throw new HttpError(404, 'Not found');
     } catch (err) {
-      if (err instanceof HttpError) return send(res, err.status, { error: err.message });
+      if (err instanceof HttpError) return send(res, err.status, { error: err.message, ...err.extra });
       if (/UNIQUE constraint failed: products\.barcode/.test(err?.message)) {
         return send(res, 409, { error: 'Another product already uses this barcode' });
       }

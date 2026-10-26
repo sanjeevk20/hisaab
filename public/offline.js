@@ -22,6 +22,16 @@ async function kv(mode, fn) {
 export const kvGet = (key) => kv('readonly', (s) => s.get(key));
 export const kvSet = (key, value) => kv('readwrite', (s) => s.put(value, key));
 
+// On sign-out, forget cached business data (reports, costs, customers) so the next person on this
+// phone only sees what their own login allows. The outbox and this device's invoice series stay.
+export async function clearPrivateCache() {
+  const keys = await kv('readonly', (s) => s.getAllKeys());
+  const keep = (k) => k === 'outbox' || k === 'device' || String(k).startsWith('seq:') || k === 'get:/settings';
+  await kv('readwrite', (s) => {
+    for (const k of keys) if (!keep(k)) s.delete(k);
+  });
+}
+
 export const newClientId = () =>
   crypto.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 

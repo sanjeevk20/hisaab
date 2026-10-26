@@ -1,7 +1,7 @@
 import { Scanner, feedback } from './scanner.js';
 import {
   kvGet, kvSet, newClientId, nowSql, saveCatalog, getCatalog, catalogFind, catalogUpsert, catalogChangeQty,
-  enqueue, getOutbox, onOutboxChange, sync, discard, retry,
+  enqueue, getOutbox, onOutboxChange, sync, discard, retry, clearPrivateCache,
 } from './offline.js';
 import {
   GST_RATES, STATES, UQC, creditNoteNumber, financialYear, gstinValid, invoiceNumber, invoiceProblem, localDate, splitTax,
@@ -28,6 +28,92 @@ function toast(msg, isError = false) {
   toastTimer = setTimeout(() => (el.className = ''), isError ? 4000 : 2500);
 }
 
+// --- signing in ---------------------------------------------------------
+
+// The signed-in person. While the shop has no logins set up there is nobody (and everyone can
+// do everything, as before); after that the server decides what each role may do, and the app
+// just hides what a cashier can't use.
+let me = null;
+let loginsOn = false;
+const isOwner = () => !me || me.role === 'owner';
+const authHeader = () => {
+  const token = localStorage.getItem('hisaab.token');
+  return token ? { authorization: `Bearer ${token}` } : {};
+};
+
+function showLogin(message = '') {
+  $('#login-shop').textContent = shopName();
+  $('#login-error').textContent = message;
+  $('#login-error').classList.toggle('hidden', !message);
+  $('#login-screen').classList.remove('hidden');
+  if (modal.open) modal.close();
+  stopAllScanners();
+  setTimeout(() => $('#login-form').username.focus(), 50);
+}
+
+$('#login-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    const { token, user } = await api('/auth/login', {
+      method: 'POST',
+      body: { username: f.username.value.trim(), pin: f.pin.value, device_id: (await kvGet('device'))?.id },
+    });
+    await signedIn(token, user);
+    f.reset();
+  } catch (err) {
+    $('#login-error').textContent = err.offline ? 'Signing in needs internet' : err.message;
+    $('#login-error').classList.remove('hidden');
+    f.pin.value = '';
+  }
+};
+
+async function signedIn(token, user) {
+  localStorage.setItem('hisaab.token', token);
+  me = user;
+  loginsOn = true;
+  await kvSet('me', me);
+  await kvSet('logins-on', true);
+  $('#login-screen').classList.add('hidden');
+  applyRole();
+  await start();
+  toast(`Signed in as ${me.name}`);
+}
+
+function applyRole() {
+  document.body.dataset.role = isOwner() ? 'owner' : 'cashier';
+  $('#shop-status').textContent = `${shopName()}${me ? ' · ' + me.name : ''}`;
+  if (!isOwner()) {
+    // Leave any owner-only screen a cashier can't use.
+    setBillMode('sale');
+    reportSide = 'sales';
+    khataSide = 'customer';
+    if (inPurchase()) purchase = emptyPurchase();
+    renderPurchase();
+    refreshCurrentView();
+  }
+}
+
+// Before someone else signs in, everything this person did offline must reach the server under
+// their own name, and their cached data is wiped from the phone.
+async function signOut() {
+  if ((await getOutbox()).some((e) => !e.error)) await trySync();
+  const waiting = (await getOutbox()).filter((e) => !e.error).length;
+  if (waiting) return toast(`${waiting} entr${waiting === 1 ? 'y has' : 'ies have'} not synced yet — connect to the internet before switching user`, true);
+  await api('/auth/logout', { method: 'POST' }).catch(() => {});
+  localStorage.removeItem('hisaab.token');
+  me = null;
+  await kvSet('me', null);
+  await clearPrivateCache();
+  cart.clear();
+  resetBill();
+  resetReturn();
+  purchase = emptyPurchase();
+  renderPurchase();
+  showView('bill');
+  showLogin();
+}
+
 // --- shop profile & invoice series --------------------------------------
 
 // The shop profile printed on invoices (from the server, kept for offline use).
@@ -38,7 +124,7 @@ const gstOn = () => Boolean(shop.gst_registered);
 async function loadShop() {
   const { data } = await cachedGet('/settings').catch(() => ({ data: null }));
   if (data) shop = data;
-  $('#shop-status').textContent = shopName();
+  $('#shop-status').textContent = `${shopName()}${me ? ' · ' + me.name : ''}`;
   $('#tax-details').classList.toggle('hidden', !gstOn());
   $('#place-of-supply').value = shop.state_code;
 }
@@ -106,7 +192,7 @@ async function api(path, { method = 'GET', body } = {}) {
   try {
     res = await fetch('/api' + path, {
       method,
-      headers: { 'content-type': 'application/json', 'x-hisaab-pin': localStorage.getItem('hisaab.pin') ?? '' },
+      headers: { 'content-type': 'application/json', 'x-hisaab-pin': localStorage.getItem('hisaab.pin') ?? '', ...authHeader() },
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(8000),
     });
@@ -116,7 +202,9 @@ async function api(path, { method = 'GET', body } = {}) {
     throw err;
   }
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401) {
+  if (res.status === 401 && data.login_required) {
+    showLogin('Please sign in again');
+  } else if (res.status === 401 && !path.startsWith('/auth/')) {
     const pin = prompt('Enter shop PIN');
     if (pin !== null) {
       localStorage.setItem('hisaab.pin', pin);
@@ -526,13 +614,14 @@ function whatsappLink(phone, text) {
 
 function showReceipt(sale) {
   const returned = (sale.returns ?? []).map((r) => `<div class="muted">Credit note ${esc(r.note_no ?? '#' + r.id)} · ${localTime(r.created_at)} · −${rupees(r.total)}</div>`).join('');
-  const body = gstOn() && (sale.invoice_no || !sale.id)
+  const by = sale.user_name ?? (!sale.id ? me?.name : null);
+  const body = (gstOn() && (sale.invoice_no || !sale.id)
     ? taxInvoiceHtml(sale, shop, { pending: !sale.id }) + returned
-    : plainReceiptHtml(sale);
+    : plainReceiptHtml(sale)) + (by ? `<p class="muted">Billed by ${esc(by)}</p>` : '');
   openModal(`${body}
     <div class="actions">
       <button class="btn ghost" data-close>Close</button>
-      ${sale.id ? '<button class="btn" data-return>↩ Return</button>' : ''}
+      ${sale.id && isOwner() ? '<button class="btn" data-return>↩ Return</button>' : ''}
       <button class="btn" data-print>Print</button>
       <a class="btn primary" href="${whatsappLink(sale.customer_phone, receiptText(sale))}" target="_blank" rel="noopener">WhatsApp</a>
     </div>`);
@@ -1063,6 +1152,7 @@ async function startStockIn(barcode) {
     return toast(err.message, true);
   }
   if (returning()) return startReturnLine(barcode);
+  if (!stockProduct && !isOwner()) return toast(`Barcode ${barcode} is not in inventory — only the owner can add new products`, true);
   // A new product already scanned onto this bill doesn't need its details asked again.
   const draft = purchase.lines.find((l) => l.barcode === barcode);
   if (!stockProduct && draft) stockProduct = { name: draft.name, price: draft.price, cost: draft.unit_cost, quantity: 0, draft: true };
@@ -1224,6 +1314,7 @@ $('#inv-list').onclick = (e) => {
   const li = e.target.closest('li[data-id]');
   if (!li) return;
   if (!li.dataset.id) return toast('This product syncs when the internet is back', true);
+  if (!isOwner()) return toast('Only the owner can change products', true);
   editProduct(Number(li.dataset.id)).catch((err) =>
     toast(err.offline ? 'Editing products needs internet' : err.message, true));
 };
@@ -1404,7 +1495,7 @@ function partyForm(sideKey, { allowOffline }, onDone) {
       <label>Name<input name="name" required autocomplete="off"></label>
       <label>Phone<input name="phone" inputmode="tel" autocomplete="off"></label>
       ${sideKey === 'supplier' ? '<label>GSTIN (optional)<input name="gstin" autocomplete="off"></label>' : ''}
-      <label>${side.openingLabel}<input name="opening" type="number" min="0" step="0.01" inputmode="decimal" value="0"></label>
+      ${isOwner() ? `<label>${side.openingLabel}<input name="opening" type="number" min="0" step="0.01" inputmode="decimal" value="0"></label>` : ''}
       <div class="actions">
         <button class="btn ghost" type="button" data-close>Cancel</button>
         <button class="btn primary">Save</button>
@@ -1421,7 +1512,7 @@ function partyForm(sideKey, { allowOffline }, onDone) {
       name: form.name.value.trim(),
       phone: form.phone.value.trim() || undefined,
       gstin: form.gstin?.value.trim() || undefined,
-      opening_balance: toPaise(form.opening.value),
+      opening_balance: toPaise(form.opening?.value),
     };
     try {
       const party = await api(side.path, { method: 'POST', body });
@@ -1541,7 +1632,9 @@ async function loadSales() {
   }
   const pending = (await getOutbox()).filter((e) => e.kind === 'sale');
   const pendingTotal = pending.reduce((sum, e) => sum + e.preview.total, 0);
-  $('#summary').innerHTML = (stale ? OFFLINE_NOTE : '') + (s ? `
+  $('#summary').innerHTML = (stale ? OFFLINE_NOTE : '') + (s?.own ? `
+    <div><strong>${rupees(s.revenue - s.refunds + pendingTotal)}</strong><span>Your sales today${pending.length ? ' (incl. offline)' : ''}</span></div>
+    <div><strong>${s.bills + pending.length}</strong><span>Your bills today</span></div>` : s ? `
     <div><strong>${rupees(s.revenue - (s.refunds ?? 0) + pendingTotal)}</strong><span>Today's sales${s.refunds ? `, after ${rupees(s.refunds)} returns` : ''}${pending.length ? ' (incl. offline)' : ''}</span></div>
     <div><strong>${s.bills + pending.length}</strong><span>Bills today</span></div>
     <div><strong>${rupees(s.udhaar_due)}</strong><span>Customers owe you</span></div>
@@ -1557,8 +1650,8 @@ async function loadSales() {
     ? rows.map((b) => `
       <li class="tap${b.id ? '' : ' pending'}" ${b.id ? `data-id="${b.id}"` : `data-pending="${b.pendingIndex}"`}>
         <div class="grow">
-          <div class="title">${b.id ? `Bill #${b.id}` : 'Not synced yet'}${b.customer_name ? ' · ' + esc(b.customer_name) : ''}</div>
-          <div class="sub">${localTime(b.created_at)} · ${PAY_LABEL[b.payment_method]}</div>
+          <div class="title">${b.id ? esc(b.invoice_no ?? `Bill #${b.id}`) : 'Not synced yet'}${b.customer_name ? ' · ' + esc(b.customer_name) : ''}</div>
+          <div class="sub">${localTime(b.created_at)} · ${PAY_LABEL[b.payment_method]}${isOwner() && b.user_name ? ' · ' + esc(b.user_name) : ''}</div>
         </div>
         <strong>${rupees(b.total)}</strong>
       </li>`).join('')
@@ -1847,7 +1940,7 @@ async function openSupplierReport(id, range) {
 // `tag` swaps the server's UTC dates in the file name for the shop's local ones.
 async function downloadFile(path, tag) {
   try {
-    const res = await fetch('/api' + path, { headers: { 'x-hisaab-pin': localStorage.getItem('hisaab.pin') ?? '' } });
+    const res = await fetch('/api' + path, { headers: { 'x-hisaab-pin': localStorage.getItem('hisaab.pin') ?? '', ...authHeader() } });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Download failed');
     let name = /filename="([^"]+)"/.exec(res.headers.get('content-disposition') ?? '')?.[1] ?? 'report.csv';
     if (tag) name = name.replace(/\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}\.csv$/, `${tag}.csv`);
@@ -1867,8 +1960,26 @@ async function downloadFile(path, tag) {
 async function openSettings() {
   await loadShop();
   const device = await kvGet('device');
+  const series = `<p class="muted">This phone's invoice series: <strong>${device ? esc(device.code) : 'not set up yet — connect to the internet once'}</strong>.</p>`;
+  const account = me ? `
+    <div class="row"><span>Signed in as <strong>${esc(me.name)}</strong> (${me.role})</span>
+      <button class="btn" type="button" data-signout>Switch user</button></div>` : '';
+  if (!isOwner()) {
+    openModal(`<h2>${esc(shopName())}</h2>${account}${series}
+      <div class="actions"><button class="btn primary" data-close>Close</button></div>`);
+    $('[data-close]', modal).onclick = () => modal.close();
+    $('[data-signout]', modal).onclick = signOut;
+    return;
+  }
   openModal(`
     <form id="settings-form">
+      ${account}
+      <div class="settings-section">
+        ${loginsOn
+          ? '<div class="row"><span>People who can sign in</span><button class="btn" type="button" data-people>👥 People</button></div>'
+          : `<p class="notice">Anyone who opens this app can see and change everything. Set up an owner login to protect it, then add cashiers.</p>
+             <button class="btn wide" type="button" data-setup>🔒 Set up owner login</button>`}
+      </div>
       <h2>Shop settings</h2>
       <label class="chip"><input type="checkbox" name="gst_registered" ${shop.gst_registered ? 'checked' : ''}> Registered under GST (regular) — issue tax invoices</label>
       <label>GSTIN<input name="gstin" value="${esc(shop.gstin)}" maxlength="15" autocapitalize="characters" autocomplete="off"></label>
@@ -1901,6 +2012,9 @@ async function openSettings() {
     </form>`);
   const form = $('#settings-form');
   $('[data-close]', form).onclick = () => modal.close();
+  $('[data-signout]', form)?.addEventListener('click', signOut);
+  $('[data-people]', form)?.addEventListener('click', openPeople);
+  $('[data-setup]', form)?.addEventListener('click', openOwnerSetup);
   $('[data-backup]', form).onclick = () => downloadFile('/backup');
   $('[data-audit]', form).onclick = openAuditLog;
   form.onsubmit = async (e) => {
@@ -1928,6 +2042,120 @@ async function openSettings() {
   };
 }
 
+// First owner login. Until this exists the shop has no logins at all.
+function openOwnerSetup() {
+  openModal(`
+    <form id="setup-form">
+      <h2>Set up the owner login</h2>
+      <p class="muted">You'll use this to sign in on every phone. The owner can see and change everything; add cashiers afterwards.</p>
+      <label>Your name<input name="name" required autocomplete="name"></label>
+      <label>Username<input name="username" required autocapitalize="none" spellcheck="false" placeholder="e.g. ramesh"></label>
+      <label>PIN (6–12 digits)<input name="pin" type="password" inputmode="numeric" pattern="\\d{6,12}" required autocomplete="new-password"></label>
+      <label>PIN again<input name="pin2" type="password" inputmode="numeric" required autocomplete="new-password"></label>
+      <div class="actions">
+        <button class="btn ghost" type="button" data-close>Cancel</button>
+        <button class="btn primary">Turn on logins</button>
+      </div>
+    </form>`);
+  const form = $('#setup-form');
+  $('[data-close]', form).onclick = () => modal.close();
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    if (form.pin.value !== form.pin2.value) return toast('The two PINs are different', true);
+    try {
+      const { token, user } = await api('/auth/setup', {
+        method: 'POST',
+        body: { name: form.name.value.trim(), username: form.username.value.trim(), pin: form.pin.value, device_id: (await kvGet('device'))?.id },
+      });
+      modal.close();
+      await signedIn(token, user);
+      openPeople();
+    } catch (err) {
+      toast(err.offline ? 'Setting up logins needs internet' : err.message, true);
+    }
+  };
+}
+
+// Owner: add cashiers (or other owners), reset PINs, switch roles, turn people off.
+async function openPeople() {
+  let users;
+  try {
+    users = await api('/users');
+  } catch (err) {
+    return toast(err.offline ? 'Managing people needs internet' : err.message, true);
+  }
+  openModal(`
+    <h2>People</h2>
+    <ul class="list">${users.map((u) => `
+      <li class="user-row" data-id="${u.id}">
+        <div class="grow">
+          <div class="title">${esc(u.name)} <span class="badge ${u.role}">${u.role}</span>${u.active ? '' : ' <span class="badge out">off</span>'}</div>
+          <div class="sub">@${esc(u.username)}${u.id === me?.id ? ' · you' : ''}</div>
+        </div>
+        <button class="btn" data-act="pin">PIN</button>
+        <button class="btn" data-act="more">⋯</button>
+      </li>`).join('')}</ul>
+    <form id="person-form" class="card">
+      <h2>Add a person</h2>
+      <label>Name<input name="name" required></label>
+      <div class="grid2">
+        <label>Username<input name="username" required autocapitalize="none" spellcheck="false"></label>
+        <label>Role<select name="role"><option value="cashier">Cashier</option><option value="owner">Owner</option></select></label>
+      </div>
+      <label>PIN (cashier 4–12 digits, owner 6–12)<input name="pin" type="password" inputmode="numeric" required autocomplete="new-password"></label>
+      <button class="btn primary wide">Add</button>
+    </form>
+    <p class="muted">A cashier can bill, take udhaar and payments, add customers and restock. They can't see cost prices, profit, suppliers or reports, take returns, or change prices and settings.</p>
+    <div class="actions"><button class="btn ghost" data-close>Close</button></div>`);
+  $('[data-close]', modal).onclick = () => modal.close();
+  const form = $('#person-form');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      await api('/users', { method: 'POST', body: { name: form.name.value.trim(), username: form.username.value.trim(), role: form.role.value, pin: form.pin.value } });
+      toast(`${form.name.value.trim()} can now sign in as ${form.username.value.trim().toLowerCase()}`);
+      openPeople();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  $('#modal-body .list').onclick = async (e) => {
+    const act = e.target.dataset.act;
+    const id = Number(e.target.closest('li[data-id]')?.dataset.id);
+    const u = users.find((x) => x.id === id);
+    if (!act || !u) return;
+    let body;
+    if (act === 'pin') {
+      const pin = prompt(`New PIN for ${u.name} (${u.role === 'owner' ? '6' : '4'}–12 digits). They'll be signed out everywhere.`);
+      if (!pin) return;
+      body = { pin };
+    } else {
+      body = await new Promise((resolve) => {
+        openModal(`
+          <h2>${esc(u.name)}</h2>
+          <p class="muted">@${esc(u.username)} · ${u.role}${u.active ? '' : ' · login turned off'}</p>
+          <button class="btn wide" data-pick="role">Make ${u.role === 'owner' ? 'cashier' : 'owner'}</button>
+          <button class="btn wide ${u.active ? 'danger' : ''}" data-pick="active">${u.active ? 'Turn off login (signs them out)' : 'Turn login back on'}</button>
+          <div class="actions"><button class="btn ghost" data-pick="">Back</button></div>`);
+        $('#modal-body').onclick = (ev) => {
+          const pick = ev.target.dataset.pick;
+          if (pick === undefined) return;
+          resolve(pick === 'role' ? { role: u.role === 'owner' ? 'cashier' : 'owner' } : pick === 'active' ? { active: !u.active } : null);
+        };
+      });
+      if (!body) return openPeople();
+    }
+    try {
+      await api(`/users/${id}`, { method: 'PATCH', body });
+      toast('Saved');
+      if (id === me?.id && (body.pin || body.role || body.active === false)) return showLogin('Your login changed — please sign in again');
+      openPeople();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+}
+
 // Rule 56(8): the log of edits to products, settings and voided numbers.
 async function openAuditLog() {
   let rows;
@@ -1943,7 +2171,7 @@ async function openAuditLog() {
     <h2>Change log</h2>
     <p class="muted">Every edit to products and settings, and every invoice number that was never issued. Bills, purchases, payments and returns are never edited; corrections are new entries.</p>
     <ul class="list">${rows.map((r) => `<li class="audit-row"><div class="grow">
-      <div><strong>${esc(r.entity)}${r.entity_id ? ' #' + r.entity_id : ''}</strong> · ${esc(r.action)}</div>
+      <div><strong>${esc(r.entity)}${r.entity_id ? ' #' + r.entity_id : ''}</strong> · ${esc(r.action)}${r.user_name ? ' · by ' + esc(r.user_name) : ''}</div>
       <div class="sub">${localTime(r.created_at)} · ${esc(what(r))}</div></div></li>`).join('') || '<p class="empty">No changes yet.</p>'}</ul>
     <div class="actions"><button class="btn primary" data-close>Close</button></div>`);
   $('[data-close]', modal).onclick = () => modal.close();
@@ -1983,20 +2211,45 @@ renderPurchase();
 renderSyncStatus();
 
 // Warm the offline copies: catalog for scanning, customers for udhaar suggestions.
-(async () => {
+async function start() {
   await loadShop();
   fillPickers();
   await ensureDevice();
   await trySync();
   await refreshCatalog();
   await cachedGet('/customers').catch(() => {});
-  await cachedGet('/suppliers').catch(() => {});
+  if (isOwner()) await cachedGet('/suppliers').catch(() => {});
   fillCustomerList();
-  purchase = { ...emptyPurchase(), ...((await kvGet('purchase-draft')) ?? {}) };
-  fillSupplierSelect();
+  if (isOwner()) {
+    purchase = { ...emptyPurchase(), ...((await kvGet('purchase-draft')) ?? {}) };
+    fillSupplierSelect();
+  }
   renderPurchase();
   if (returning()) fillReturnBills();
-})();
+  refreshCurrentView();
+}
+
+// Who is this? Online, the server says; offline, carry on as whoever last signed in on this phone.
+async function boot() {
+  let status = null;
+  try {
+    status = await api('/auth/status');
+  } catch { /* offline */ }
+  if (status) {
+    loginsOn = !status.setup_required;
+    me = status.user;
+    await kvSet('me', me);
+    await kvSet('logins-on', loginsOn);
+  } else {
+    me = (await kvGet('me')) ?? null;
+    loginsOn = (await kvGet('logins-on')) === true;
+  }
+  await loadShop();
+  if (loginsOn && !me) return showLogin(status ? '' : 'You are offline. Signing in needs internet.');
+  applyRole();
+  await start();
+}
+boot();
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => { /* offline shell is a bonus, not required */ });
