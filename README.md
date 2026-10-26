@@ -18,6 +18,43 @@ A phone-first web app for kirana / small retail shops:
 
 Products are never deleted when they sell out — they drop to 0 and show as *Out of stock*, so the next restock is still a single scan and past bills stay intact.
 
+## GST compliance (regular registration)
+
+Tap the shop name in the header → **Settings**, tick *Registered under GST (regular)*, and enter your GSTIN (the check digit is verified), legal name and address. From then on:
+
+**Tax invoices (Rule 46).** Every bill is a *Tax Invoice* with your name, address, GSTIN and state; a serial number unique to the financial year (at most 16 characters, e.g. `A/26-27/00001`); the date; place of supply; *Reverse charge: No*; and per item the HSN code, quantity and unit, rate, taxable value and GST rate. A tax summary shows CGST + SGST (intra-state) or IGST (inter-state) for each rate. It also prints the amount in words and a signatory line.
+- **B2B:** open *Business buyer (GSTIN)* at checkout, enter the buyer's GSTIN, legal name and address. Every item then needs an HSN code (4 digits, or 6 above ₹5 crore turnover; Notification 78/2020).
+- **B2C ≥ ₹50,000:** the customer's name and address are required.
+- **Place of supply** defaults to your state, since goods handed over at the counter are supplied there. Change it only when you deliver to another state; that makes the invoice IGST.
+- **GST rates:** only current rates can be used: 0, 0.25, 3, 5, 18, 40%, and 28% for the tobacco items still on it. 12% items are flagged in Inventory for you to update.
+
+**Numbering that works offline.** Rule 46(b) allows more than one series, so each phone gets its own (`A`, `B`, …) the first time it connects. It can then number invoices and credit notes with no internet, and two phones can never issue the same number. Numbers restart every 1 April (Indian time). If an offline bill is discarded, its number is reported as cancelled, never reused.
+
+**Credit notes for returns (Rule 53, Section 34).** A customer return produces a *Credit Note* with its own series (`CNA/26-27/0001`). It quotes the original invoice number and date and reverses the tax exactly as the invoice charged it. It must be issued by 30 November after the end of that invoice's financial year, and returns without a bill aren't allowed (there's no invoice to credit).
+
+**GSTR-1 (Reports → GST).** Pick the month to see the taxable value and output tax (CGST, SGST, IGST), then download each table as CSV in the GST offline tool's layout:
+- B2B
+- B2C large (inter-state above ₹1 lakh, Rule 59(4) since August 2024)
+- B2C small (by state and rate, net of credit notes)
+- CDNR and CDNUR
+- HSN summary split B2B / B2C (Table 12)
+- Documents issued (Table 13, with cancelled numbers)
+
+The tables add up: B2B + B2C − credit notes = HSN summary = the month's total.
+
+**Records (Rules 56–57).** Bills, purchases, payments and returns are never edited or deleted; corrections are new entries. Edits to products and settings, and voided numbers, go into a **change log** (Settings → Change log). The server writes a **backup every day** to `data/backups/` and keeps 60 days (`HISAAB_BACKUP_DIR`, `HISAAB_BACKUP_KEEP`). Settings → *Download backup* gives you a copy to keep off the machine. Records are kept indefinitely; the law asks for at least 72 months.
+
+**Not covered — use your CA or other software for these:**
+- e-invoicing (IRN/QR; only above ₹5 crore turnover)
+- e-way bills
+- GSTR-3B filing (the GST tab gives the outward-tax figures for 3.1(a))
+- input tax credit / GSTR-2B reconciliation of purchases
+- compensation cess
+- composition scheme (bill of supply)
+- uploading to the GST portal (use the offline tool with these CSVs)
+
+Have your CA review an invoice and a month's GSTR-1 files before you rely on them.
+
 ## Run it
 
 Requires Node.js 22.13+ (uses the built-in SQLite — no `npm install` needed).
@@ -75,7 +112,7 @@ All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills 
 | `PATCH /api/products/:id` | any of name, price, cost, gst_rate, low_stock, barcode | Edit product |
 | `POST /api/products/:id/stock` | `{change, reason: "stock_in"\|"adjustment", note?}` | Manual stock change |
 | `GET /api/products/:id/movements` | | Stock history |
-| `POST /api/sales` | `{items:[{product_id \| barcode, quantity}], discount?, payment_method?: cash\|upi\|card\|credit, customer_id? \| customer_name? + customer_phone?, client_id?, created_at?, offline?}` | Create bill + remove stock (atomic). `credit` puts it on the customer's khata |
+| `POST /api/sales` | `{items:[{product_id \| barcode, quantity}], discount?, payment_method?: cash\|upi\|card\|credit, customer_id? \| customer_name? + customer_phone?, invoice_no?, buyer_gstin?, buyer_address?, place_of_supply?, client_id?, created_at?, offline?}` | Create bill + remove stock (atomic). `credit` puts it on the customer's khata. For a GST-registered shop it's a tax invoice: numbered (the device's `invoice_no`, or the server's own series `0/…`), validated, with CGST/SGST/IGST per line. Offline sales also send each line as printed (`unit_price`, `gst_rate`, `hsn`, `unit`) |
 | `GET /api/customers` | `?q=`, `?due=1` | Customers with current balance, largest dues first |
 | `POST /api/customers` | `{name, phone?, opening_balance?}` | Add customer (opening balance from a paper khata) |
 | `GET /api/customers/:id` | | Customer, balance and khata entries |
@@ -91,18 +128,26 @@ All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills 
 | `GET /api/reports/suppliers` | `?from=&to=` (UTC, `to` exclusive; default this month), `&format=csv` | Per-supplier bills, purchased, returned, net, paid, refunded, balance, last purchase, with totals |
 | `GET /api/reports/suppliers/:id` | same | One supplier: summary, items bought (qty, amount, avg cost, returned), purchases and returns |
 | `GET /api/sales`, `GET /api/sales/:id` | `?from=&to=&limit=` | Bills; a single bill includes `returnable` (per line: what can still come back and its `unit_refund`) and earlier `returns` |
-| `POST /api/sale-returns` | `{sale_id?, items:[{barcode, quantity}], refund_method?: cash\|upi\|card\|khata, restock?, reason?, customer_id? \| customer_name? + customer_phone?, client_id?, created_at?}` | Customer return. With `sale_id`: refund what was paid, capped at what's left on the bill. `khata` takes it off udhaar (customer from the bill, or given). `restock: false` for damaged goods |
+| `POST /api/sale-returns` | `{note_no?, sale_id?, items:[{barcode, quantity}], refund_method?: cash\|upi\|card\|khata, restock?, reason?, customer_id? \| customer_name? + customer_phone?, client_id?, created_at?}` | Customer return. With `sale_id`: refund what was paid, capped at what's left on the bill. `khata` takes it off udhaar (customer from the bill, or given). `restock: false` for damaged goods |
 | `GET /api/sale-returns`, `GET /api/sale-returns/:id` | `?sale_id=&limit=` | Customer returns |
+| `GET /api/settings`, `PUT /api/settings` | `{legal_name, trade_name, address, gstin, phone, email, gst_registered, hsn_digits: 4\|6, tz_offset, invoice_terms}` | Shop profile printed on invoices. Changes are audit-logged |
+| `POST /api/devices`, `GET /api/devices/:id` | `{name?}` | Register a device's own invoice series; get its last used numbers |
+| `POST /api/documents/void` | `{number, reason?}` | Report a device-allocated number that will never be issued |
+| `GET /api/reports/gstr1` | `?month=2026-10`, `&section=b2b\|b2cl\|b2cs\|cdnr\|cdnur\|hsn_b2b\|hsn_b2c\|docs&format=csv` | GSTR-1 tables for the month (shop's local time) |
+| `GET /api/audit-log` | `?entity=&limit=` | Log of edits (Rule 56(8)) |
+| `GET /api/backup` | | Download a consistent copy of the database |
 | `GET /api/reports/profit` | `?from=&to=` (UTC, default this month), `&tz=330` (minutes from UTC, for local days), `&format=csv` (`&by=day` for daily rows) | Summary (gross sales, returns, net sales, cost of goods, gross profit, margin, GST, products without cost), `by_day`, `by_product` |
 | `GET /api/summary` | `?since=YYYY-MM-DD HH:MM:SS` (UTC) | Dashboard numbers |
 
 ## Layout
 
 ```
-server/db.js      schema, migrations + data access (SQLite, transactions, stock ledger, customer & supplier khata, purchases)
+server/db.js      schema, migrations (incl. table rebuilds) + data access (SQLite, transactions, stock ledger, customer & supplier khata, purchases)
 server/app.js     JSON API + static hosting
 server/index.js   entry point (HTTP/HTTPS)
 public/           mobile web app (no build step)
+  gst.js          GST rules shared by server and app: GSTIN check, states, rates, tax split, numbering, FY
+  invoice.js      printable tax invoice and credit note
   offline.js      IndexedDB cache, outbox queue and sync
   sw.js           service worker (offline app shell) — bump CACHE when changing app files
 test/             API tests (node:test)
@@ -111,6 +156,8 @@ test/             API tests (node:test)
 ## Possible next steps
 
 - Multi-user logins and roles (owner vs. cashier), multiple shops
+- Owner and cashier logins (today one shared PIN); encrypted off-site backups
+- Purchase-side GST (supplier invoice details for ITC and GSTR-2B matching); GSTR-3B worksheet
 - Reorder suggestions from sales speed and low stock; slow-moving / dead stock report
 - Full GST invoices (GSTIN, HSN codes, CGST/SGST split), thermal printer support
 - Product lookup from a public barcode catalog; SMS reminders for udhaar

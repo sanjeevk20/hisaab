@@ -196,3 +196,31 @@ a.btn { text-decoration: none; text-align: center; }
 .day-bars .bar.neg i { background: var(--danger); }
 .day-bars .bar span { font-size: 9px; color: var(--muted); text-align: center; line-height: 14px; }
 .return-max { font-size: 12px; color: var(--muted); }
+#report-side { grid-template-columns: repeat(4, 1fr); }
+#tax-details { margin: 8px 0; }
+#tax-details summary { cursor: pointer; color: var(--brand); font-weight: 600; padding: 6px 0; }
+.receipt.invoice { font-family: system-ui, sans-serif; font-size: 12px; }
+.inv-title { text-align: center; font-weight: 800; letter-spacing: .08em; font-size: 14px; margin-bottom: 6px; }
+.inv-head { text-align: center; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+.inv-head h3 { margin: 0; font-size: 16px; }
+.inv-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin: 8px 0; }
+.inv-party { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin: 6px 0; }
+.inv-label { font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: .05em; }
+.receipt.invoice table { width: 100%; border-collapse: collapse; margin: 6px 0; font-variant-numeric: tabular-nums; }
+.receipt.invoice th { text-align: left; font-size: 10px; color: var(--muted); border-bottom: 1px solid var(--line); padding: 3px 2px; }
+.receipt.invoice td { padding: 3px 2px; border-bottom: 1px dashed var(--line); vertical-align: top; }
+.inv-items td:nth-child(n+4), .inv-items th:nth-child(n+4), .inv-tax td:nth-child(n+2), .inv-tax th:nth-child(n+2),
+.inv-totals td:last-child { text-align: right; }
+.inv-totals td { border-bottom: 0 !important; font-size: 13px; }
+.inv-words { font-style: italic; margin: 4px 0; }
+.inv-terms { font-size: 11px; color: var(--muted); margin-top: 6px; }
+.inv-sign { text-align: right; margin-top: 14px; }
+.settings-section { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
+.audit-row { font-size: 12px; }
+@media print {
+  .receipt.invoice { font-size: 11px; color: #000; }
+  .receipt.invoice .muted, .inv-label, .receipt.invoice th { color: #333; }
+}
+.inv-meta strong { white-space: nowrap; }
+dialog .actions { flex-wrap: wrap; }
+dialog .actions .btn { flex: 1 1 auto; }

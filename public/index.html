@@ -78,6 +78,13 @@
         <input id="cust-name" placeholder="Customer name (optional)" list="customer-names" autocomplete="off">
         <input id="cust-phone" placeholder="Customer phone (optional)" inputmode="tel" autocomplete="off">
         <datalist id="customer-names"></datalist>
+        <details id="tax-details" class="hidden">
+          <summary>Business buyer (GSTIN) or customer address</summary>
+          <input id="buyer-gstin" placeholder="Buyer GSTIN — makes this a B2B invoice" maxlength="15" autocomplete="off" autocapitalize="characters">
+          <input id="buyer-address" placeholder="Buyer address" autocomplete="off">
+          <label>Place of supply<select id="place-of-supply" data-states></select></label>
+          <p class="muted" id="tax-hint">Goods handed over at your counter are supplied in your state. Change this only if you deliver to another state.</p>
+        </details>
         <p id="cust-due" class="muted hidden"></p>
         <div class="actions">
           <button id="clear-cart" class="btn ghost" type="button">Clear</button>
@@ -110,10 +117,10 @@
           <div class="grid2">
             <label>Selling price ₹<input name="price" type="number" min="0" step="0.01" inputmode="decimal" required></label>
             <label class="quick-only">Cost price ₹<input name="cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
-            <label>GST %<select name="gst_rate">
-              <option value="0">0</option><option value="5">5</option><option value="12">12</option>
-              <option value="18">18</option><option value="28">28</option></select></label>
+            <label>GST %<select name="gst_rate" data-gst-rates></select></label>
             <label>Low-stock alert at<input name="low_stock" type="number" min="0" value="5" inputmode="numeric"></label>
+            <label>HSN code<input name="hsn" inputmode="numeric" pattern="\d{4}(\d{2}){0,2}" maxlength="8" placeholder="e.g. 0902" autocomplete="off"></label>
+            <label>Unit<select name="unit" data-units></select></label>
           </div>
         </div>
         <div class="grid2">
@@ -199,6 +206,7 @@
         <button data-side="sales" class="active" role="tab">Sales</button>
         <button data-side="profit" role="tab">Profit</button>
         <button data-side="suppliers" role="tab">Suppliers</button>
+        <button data-side="gst" role="tab">GST</button>
       </div>
       <div id="report-toolbar" class="toolbar hidden">
         <select id="report-period">
@@ -229,6 +237,16 @@
           </select>
         </div>
         <ul id="profit-list" class="list"></ul>
+      </div>
+      <div id="gst-report" class="hidden">
+        <div class="toolbar">
+          <select id="gst-month"></select>
+          <button id="gst-csv-all" class="btn" type="button">⬇ All CSVs</button>
+        </div>
+        <div id="gst-totals" class="stats"></div>
+        <div id="gst-warnings"></div>
+        <ul id="gst-sections" class="list"></ul>
+        <p class="muted">Files follow the GST offline tool's CSV layout. Check them with your CA before filing.</p>
       </div>
       <div id="supplier-report" class="hidden">
         <div id="report-totals" class="stats"></div>

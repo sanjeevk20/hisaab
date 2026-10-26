@@ -1,10 +1,13 @@
 // HTTP layer: a small JSON API plus static hosting for the mobile web app in /public.
 // Amounts in the API are integer paise (₹1 = 100).
-import { readFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
-import { HttpError } from './db.js';
+import { HttpError, GST_RATES, UQC, hsnValid } from './db.js';
+import { gstDate } from '../public/gst.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const MIME = {
@@ -47,9 +50,27 @@ function int(v, field, { required = false, min = 0, max = 1e12 } = {}) {
 
 function rate(v) {
   if (v === undefined || v === null) return undefined;
-  if (typeof v !== 'number' || v < 0 || v > 100) throw new HttpError(400, 'gst_rate must be 0–100');
+  if (!GST_RATES.includes(v)) throw new HttpError(400, `gst_rate must be one of ${GST_RATES.join(', ')}`);
   return v;
 }
+
+function hsn(v, field = 'hsn') {
+  const s = str(v === undefined || v === null ? v : String(v), field, { max: 8 });
+  if (s !== undefined && !hsnValid(s)) throw new HttpError(400, `${field} must be 4, 6 or 8 digits`);
+  return s;
+}
+
+function unit(v, field = 'unit') {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (!UQC[v]) throw new HttpError(400, `${field} must be one of ${Object.keys(UQC).join(', ')}`);
+  return v;
+}
+
+const bool = (v, field) => {
+  if (v === undefined) return undefined;
+  if (typeof v !== 'boolean') throw new HttpError(400, `${field} must be true or false`);
+  return v;
+};
 
 // Time an offline device says an action happened (ISO 8601) → SQLite UTC text.
 function clientTime(v) {
@@ -102,6 +123,50 @@ function csv(filename, rows) {
 }
 const CSV = Symbol('csv');
 
+// GSTR-1 tables in the GST offline tool's CSV layout. Amounts in rupees, dates dd-Mon-yyyy.
+const rateCol = (r) => String(r.rate);
+const HSN_CSV = {
+  header: ['HSN', 'Description', 'UQC', 'Total Quantity', 'Total Value', 'Rate', 'Taxable Value', 'Integrated Tax Amount',
+    'Central Tax Amount', 'State/UT Tax Amount', 'Cess Amount'],
+  row: (r) => [r.hsn, r.description, r.uqc, r.quantity, money(r.value), rateCol(r), money(r.taxable), money(r.igst),
+    money(r.cgst), money(r.sgst), '0.00'],
+};
+const GSTR1_CSV = {
+  b2b: {
+    header: ['GSTIN/UIN of Recipient', 'Receiver Name', 'Invoice Number', 'Invoice date', 'Invoice Value', 'Place Of Supply',
+      'Reverse Charge', 'Applicable % of Tax Rate', 'Invoice Type', 'E-Commerce GSTIN', 'Rate', 'Taxable Value', 'Cess Amount'],
+    row: (r) => [r.gstin, r.receiver_name, r.invoice_no, gstDate(r.invoice_date), money(r.invoice_value), r.place_of_supply,
+      r.reverse_charge, '', r.invoice_type, '', rateCol(r), money(r.taxable), '0.00'],
+  },
+  b2cl: {
+    header: ['Invoice Number', 'Invoice date', 'Invoice Value', 'Place Of Supply', 'Applicable % of Tax Rate', 'Rate',
+      'Taxable Value', 'Cess Amount', 'E-Commerce GSTIN'],
+    row: (r) => [r.invoice_no, gstDate(r.invoice_date), money(r.invoice_value), r.place_of_supply, '', rateCol(r), money(r.taxable), '0.00', ''],
+  },
+  b2cs: {
+    header: ['Type', 'Place Of Supply', 'Applicable % of Tax Rate', 'Rate', 'Taxable Value', 'Cess Amount', 'E-Commerce GSTIN'],
+    row: (r) => [r.type, r.place_of_supply, '', rateCol(r), money(r.taxable), '0.00', ''],
+  },
+  cdnr: {
+    header: ['GSTIN/UIN of Recipient', 'Receiver Name', 'Note Number', 'Note Date', 'Note Type', 'Place Of Supply', 'Reverse Charge',
+      'Note Supply Type', 'Note Value', 'Applicable % of Tax Rate', 'Rate', 'Taxable Value', 'Cess Amount'],
+    row: (r) => [r.gstin, r.receiver_name, r.note_no, gstDate(r.note_date), r.note_type, r.place_of_supply, r.reverse_charge,
+      r.supply_type, money(r.note_value), '', rateCol(r), money(r.taxable), '0.00'],
+  },
+  cdnur: {
+    header: ['UR Type', 'Note Number', 'Note Date', 'Note Type', 'Place Of Supply', 'Note Value', 'Applicable % of Tax Rate',
+      'Rate', 'Taxable Value', 'Cess Amount'],
+    row: (r) => [r.ur_type, r.note_no, gstDate(r.note_date), r.note_type, r.place_of_supply, money(r.note_value), '', rateCol(r), money(r.taxable), '0.00'],
+  },
+  hsn_b2b: HSN_CSV,
+  hsn_b2c: HSN_CSV,
+  docs: {
+    header: ['Nature of Document', 'Sr. No. From', 'Sr. No. To', 'Total Number', 'Cancelled'],
+    row: (r) => [r.nature, r.from, r.to, r.total, r.cancelled],
+  },
+};
+const STREAMED = Symbol('streamed'); // the route already wrote the response
+
 function productFields(body, { partial }) {
   const fields = {
     barcode: str(body.barcode, 'barcode', { required: !partial, max: 64 }),
@@ -110,6 +175,8 @@ function productFields(body, { partial }) {
     cost: int(body.cost, 'cost'),
     gst_rate: rate(body.gst_rate),
     low_stock: int(body.low_stock, 'low_stock', { max: 1e6 }),
+    hsn: body.hsn === '' && partial ? null : hsn(body.hsn),
+    unit: unit(body.unit),
   };
   if (!partial) fields.quantity = int(body.quantity, 'quantity', { max: 1e6 }) ?? 0;
   return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
@@ -369,6 +436,8 @@ function routes(store) {
         price: int(it?.price, `items[${i}].price`),
         gst_rate: rate(it?.gst_rate),
         low_stock: int(it?.low_stock, `items[${i}].low_stock`, { max: 1e6 }),
+        hsn: hsn(it?.hsn, `items[${i}].hsn`),
+        unit: unit(it?.unit, `items[${i}].unit`),
       }));
       const supplier_id = int(body.supplier_id, 'supplier_id', { min: 1 }) ?? null;
       const supplier_name = str(body.supplier_name, 'supplier_name') ?? null;
@@ -444,8 +513,81 @@ function routes(store) {
         customer_phone: str(body.customer_phone, 'customer_phone', { max: 20 }) ?? null,
         client_id: str(body.client_id, 'client_id', { max: 64 }) ?? null,
         created_at: clientTime(body.created_at),
+        note_no: str(body.note_no, 'note_no', { max: 16 }) ?? null,
       });
       return [r.duplicate ? 200 : 201, r];
+    }],
+
+    // GSTR-1 for a month: ?month=2026-10. &section=b2b|b2cl|b2cs|cdnr|cdnur|hsn_b2b|hsn_b2c|docs&format=csv
+    // gives that table in the column layout of the GST offline tool.
+    ['GET', /^\/api\/reports\/gstr1$/, (_req, _m, url) => {
+      const report = store.gstr1(url.searchParams.get('month') ?? '');
+      if (url.searchParams.get('format') !== 'csv') return report;
+      const section = url.searchParams.get('section');
+      const layout = GSTR1_CSV[section];
+      if (!layout) throw new HttpError(400, `section must be one of ${Object.keys(GSTR1_CSV).join(', ')}`);
+      return csv(`gstr1_${report.month}_${section}.csv`, [layout.header, ...report[section].map(layout.row)]);
+    }],
+
+    ['GET', /^\/api\/settings$/, () => store.getShop()],
+
+    // Shop profile printed on invoices: { legal_name, trade_name, address, gstin, phone, email,
+    //   gst_registered, hsn_digits: 4 | 6, tz_offset, invoice_terms }
+    ['PUT', /^\/api\/settings$/, async (req) => {
+      const body = await readJson(req);
+      const fields = {
+        legal_name: str(body.legal_name, 'legal_name'),
+        trade_name: str(body.trade_name, 'trade_name'),
+        address: str(body.address, 'address', { max: 300 }),
+        gstin: str(body.gstin, 'gstin', { max: 15 }),
+        state_code: str(body.state_code, 'state_code', { max: 2 }),
+        phone: str(body.phone, 'phone', { max: 20 }),
+        email: str(body.email, 'email', { max: 100 }),
+        gst_registered: bool(body.gst_registered, 'gst_registered'),
+        hsn_digits: int(body.hsn_digits, 'hsn_digits', { min: 4, max: 6 }),
+        tz_offset: int(body.tz_offset, 'tz_offset', { min: -720, max: 840 }),
+        invoice_terms: str(body.invoice_terms, 'invoice_terms', { max: 300 }),
+      };
+      // Allow clearing text fields with an empty string.
+      for (const k of ['trade_name', 'phone', 'email', 'invoice_terms', 'gstin']) if (body[k] === '') fields[k] = '';
+      return store.updateShop(Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined)));
+    }],
+
+    // A phone or browser asks for its own invoice series: { name? }
+    ['POST', /^\/api\/devices$/, async (req) => {
+      const body = await readJson(req);
+      return [201, store.registerDevice(str(body.name, 'name', { max: 60 }) ?? null)];
+    }],
+
+    ['GET', /^\/api\/devices\/(\d+)$/, (_req, m) => {
+      const d = store.getDevice(Number(m[1]));
+      if (!d) throw new HttpError(404, 'Device not found');
+      return d;
+    }],
+
+    // A number a device allocated but will never issue: { number, reason? }
+    ['POST', /^\/api\/documents\/void$/, async (req) => {
+      const body = await readJson(req);
+      return [201, store.voidNumber(str(body.number, 'number', { required: true, max: 16 }), str(body.reason, 'reason') ?? null)];
+    }],
+
+    ['GET', /^\/api\/audit-log$/, (_req, _m, url) =>
+      store.listAudit({ entity: url.searchParams.get('entity') ?? undefined, limit: Math.min(Number(url.searchParams.get('limit')) || 100, 1000) })],
+
+    // A full copy of the database, for safe keeping (Rule 57).
+    ['GET', /^\/api\/backup$/, async (_req, _m, _url, res) => {
+      const dir = await mkdtemp(join(tmpdir(), 'hisaab-backup-'));
+      const file = join(dir, 'hisaab.db');
+      store.backupTo(file);
+      const name = `hisaab-backup-${new Date().toISOString().slice(0, 10)}.db`;
+      res.writeHead(200, {
+        'content-type': 'application/vnd.sqlite3',
+        'content-disposition': `attachment; filename="${name}"`,
+        'cache-control': 'no-store',
+      });
+      await new Promise((resolve, reject) => createReadStream(file).on('error', reject).on('end', resolve).pipe(res));
+      await rm(dir, { recursive: true, force: true });
+      return STREAMED;
     }],
 
     // Gross profit for a period: ?from=&to= (UTC, default this month), &tz=330 (minutes east of UTC,
@@ -484,7 +626,17 @@ function routes(store) {
       const items = body.items.map((it, i) => {
         const product_id = int(it?.product_id, `items[${i}].product_id`, { min: 1 });
         const barcode = product_id ? undefined : str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 });
-        return { product_id, barcode, quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }) };
+        const item = { product_id, barcode, quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }) };
+        // An offline sale sends each line as printed on the customer's invoice.
+        if (body.offline === true && it?.unit_price !== undefined) {
+          Object.assign(item, {
+            unit_price: int(it.unit_price, `items[${i}].unit_price`),
+            gst_rate: rate(it.gst_rate) ?? 0,
+            hsn: hsn(it.hsn, `items[${i}].hsn`) ?? null,
+            unit: unit(it.unit, `items[${i}].unit`) ?? 'NOS',
+          });
+        }
+        return item;
       });
       const payment_method = body.payment_method ?? 'cash';
       if (!PAYMENT_METHODS.includes(payment_method)) {
@@ -500,6 +652,10 @@ function routes(store) {
         client_id: str(body.client_id, 'client_id', { max: 64 }) ?? null,
         created_at: clientTime(body.created_at),
         allowOversell: body.offline === true,
+        invoice_no: str(body.invoice_no, 'invoice_no', { max: 16 }) ?? null,
+        buyer_gstin: str(body.buyer_gstin, 'buyer_gstin', { max: 15 }) ?? null,
+        buyer_address: str(body.buyer_address, 'buyer_address', { max: 300 }) ?? null,
+        place_of_supply: str(body.place_of_supply, 'place_of_supply', { max: 2 }) ?? null,
       });
       return [sale.duplicate ? 200 : 201, sale];
     }],
@@ -522,7 +678,8 @@ export function createHandler(store, { pin } = {}) {
       for (const [method, pattern, fn] of table) {
         const m = url.pathname.match(pattern);
         if (m && req.method === method) {
-          const out = await fn(req, m, url);
+          const out = await fn(req, m, url, res);
+          if (out === STREAMED) return;
           if (out?.[CSV]) {
             res.writeHead(200, {
               'content-type': 'text/csv; charset=utf-8',

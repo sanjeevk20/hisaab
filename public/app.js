@@ -3,18 +3,19 @@ import {
   kvGet, kvSet, newClientId, nowSql, saveCatalog, getCatalog, catalogFind, catalogUpsert, catalogChangeQty,
   enqueue, getOutbox, onOutboxChange, sync, discard, retry,
 } from './offline.js';
+import {
+  GST_RATES, STATES, UQC, creditNoteNumber, financialYear, gstinValid, invoiceNumber, invoiceProblem, localDate, splitTax,
+  stateLabel, taxOf,
+} from './gst.js';
+import { esc, rupees, taxInvoiceHtml, creditNoteHtml } from './invoice.js';
 
 // --- helpers ------------------------------------------------------------
 
 const $ = (sel, root = document) => root.querySelector(sel);
-const rupees = (paise) => (paise < 0 ? '−₹' : '₹')
-  + (Math.abs(paise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const toPaise = (v) => Math.round((parseFloat(v) || 0) * 100);
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 // SQLite stores UTC 'YYYY-MM-DD HH:MM:SS'; show it in local time.
 const localTime = (s) => new Date(s.replace(' ', 'T') + 'Z').toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
 const digits = (s) => String(s ?? '').replace(/\D/g, '').replace(/^91(\d{10})$/, '$1');
-const SHOP_NAME = localStorage.getItem('hisaab.shop') || 'My Shop';
 const PAY_LABEL = { cash: 'Cash', upi: 'UPI', card: 'Card', credit: 'Udhaar', bank: 'Bank', cheque: 'Cheque' };
 const OFFLINE_NOTE = '<p class="notice">Offline — showing the copy saved on this phone.</p>';
 
@@ -25,6 +26,78 @@ function toast(msg, isError = false) {
   el.className = 'show' + (isError ? ' error' : '');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (el.className = ''), isError ? 4000 : 2500);
+}
+
+// --- shop profile & invoice series --------------------------------------
+
+// The shop profile printed on invoices (from the server, kept for offline use).
+let shop = { gst_registered: false, state_code: '', tz_offset: 330, hsn_digits: 4 };
+const shopName = () => shop.trade_name || shop.legal_name || localStorage.getItem('hisaab.shop') || 'My Shop';
+const gstOn = () => Boolean(shop.gst_registered);
+
+async function loadShop() {
+  const { data } = await cachedGet('/settings').catch(() => ({ data: null }));
+  if (data) shop = data;
+  $('#shop-status').textContent = shopName();
+  $('#tax-details').classList.toggle('hidden', !gstOn());
+  $('#place-of-supply').value = shop.state_code;
+}
+
+// Each device numbers its own invoices and credit notes (see gst.js), so it can issue them
+// offline. The series is registered once while online.
+async function ensureDevice() {
+  let device = await kvGet('device');
+  try {
+    if (!device) {
+      const d = await api('/devices', { method: 'POST', body: { name: navigator.userAgent.slice(0, 60) } });
+      device = { id: d.id, code: d.code };
+      await kvSet('device', device);
+    }
+    // Carry on from the server's count, in case this phone's storage was cleared.
+    for (const c of (await api(`/devices/${device.id}`)).counters) {
+      const key = `seq:${c.doc}:${c.fy}`;
+      if (((await kvGet(key)) ?? 0) < c.last) await kvSet(key, c.last);
+    }
+  } catch { /* offline: carry on with what this phone has */ }
+  return device;
+}
+
+// Next number from this device's series, for a document dated now.
+async function allocateNumber(doc) {
+  const device = await kvGet('device');
+  if (!device) throw new Error('Connect to the internet once so this phone gets its own invoice series');
+  const fy = financialYear(localDate(nowSql(), shop.tz_offset)).short;
+  const key = `seq:${doc}:${fy}`;
+  const seq = ((await kvGet(key)) ?? 0) + 1;
+  await kvSet(key, seq);
+  return doc === 'invoice' ? invoiceNumber(device.code, fy, seq) : creditNoteNumber(device.code, fy, seq);
+}
+
+// A number allocated for a document that was never issued is reported to the server, so it shows
+// as cancelled in GSTR-1 instead of as an unexplained gap.
+function voidNumber(number, reason) {
+  if (!number) return;
+  api('/documents/void', { method: 'POST', body: { number, reason } }).catch(() =>
+    enqueue({ kind: 'void', path: '/documents/void', body: { number, reason, client_id: newClientId() }, label: `Unused number ${number}` }));
+}
+
+// Fill the shared pickers (GST rates, units, states) wherever they appear.
+function fillPickers(root = document) {
+  for (const sel of root.querySelectorAll('[data-gst-rates]')) {
+    const v = sel.dataset.value ?? sel.value;
+    sel.innerHTML = GST_RATES.map((r) => `<option value="${r}">${r}%</option>`).join('');
+    if (v !== '') sel.value = v;
+  }
+  for (const sel of root.querySelectorAll('[data-units]')) {
+    const v = sel.dataset.value ?? sel.value;
+    sel.innerHTML = Object.entries(UQC).map(([k, name]) => `<option value="${k}">${k} — ${name.toLowerCase()}</option>`).join('');
+    sel.value = v || 'NOS';
+  }
+  for (const sel of root.querySelectorAll('[data-states]')) {
+    const v = sel.dataset.value ?? sel.value;
+    sel.innerHTML = Object.keys(STATES).map((c) => `<option value="${c}">${esc(stateLabel(c))}</option>`).join('');
+    sel.value = v || shop.state_code;
+  }
 }
 
 // Throws with err.offline = true when the server can't be reached, so callers can fall back.
@@ -158,7 +231,11 @@ $('#sync-status').onclick = async () => {
   $('#modal-body').onclick = async (e) => {
     const { retry: r, discard: d } = e.target.dataset;
     if (r) await retry(r);
-    if (d && confirm('Discard this entry? It will never reach the server.')) await discard(d);
+    if (d && confirm('Discard this entry? It will never reach the server.')) {
+      const entry = (await getOutbox()).find((x) => x.body.client_id === d);
+      voidNumber(entry?.body.invoice_no ?? entry?.body.note_no, 'Discarded before it reached the server');
+      await discard(d);
+    }
     if (r || d) {
       modal.close();
       if (r) trySync();
@@ -300,6 +377,10 @@ function resetBill() {
   $('#cust-phone').value = '';
   $('#cust-due').classList.add('hidden');
   $('input[name=pay][value=cash]').checked = true;
+  $('#buyer-gstin').value = '';
+  $('#buyer-address').value = '';
+  $('#place-of-supply').value = shop.state_code;
+  $('#tax-details').open = false;
   renderCart();
 }
 
@@ -339,14 +420,34 @@ $('#do-checkout').onclick = async (e) => {
     return toast('Enter the customer name for udhaar', true);
   }
   const lines = [...cart.values()];
-  const { subtotal, discount, total } = cartTotals();
+  const { discount, total } = cartTotals();
+  const buyer_gstin = gstOn() ? $('#buyer-gstin').value.trim().toUpperCase() || undefined : undefined;
+  const buyer_address = gstOn() ? $('#buyer-address').value.trim() || undefined : undefined;
+  const place_of_supply = gstOn() ? $('#place-of-supply').value || undefined : undefined;
+  if (gstOn()) {
+    // Same rules as the server, checked before a number is used or anything is printed.
+    const problem = invoiceProblem(shop, lines.map(({ product: p }) => ({ name: p.name, gst_rate: p.gst_rate, hsn: p.hsn })),
+      { buyer_gstin, customer_name, buyer_address, total });
+    if (problem) {
+      if (/address|name/.test(problem)) $('#tax-details').open = true;
+      return toast(problem, true);
+    }
+  }
+
+  btn.disabled = true;
+  let invoice_no;
+  try {
+    if (gstOn()) invoice_no = await allocateNumber('invoice');
+  } catch (err) {
+    btn.disabled = false;
+    return toast(err.message, true);
+  }
   const body = {
     items: lines.map(({ product, quantity }) => ({ barcode: product.barcode, quantity })),
     discount, payment_method, customer_name, customer_phone,
+    invoice_no, buyer_gstin, buyer_address, place_of_supply,
     client_id: newClientId(),
   };
-
-  btn.disabled = true;
   try {
     // Anything queued earlier (e.g. a product added offline) must reach the server first.
     if ((await getOutbox()).length) await trySync();
@@ -356,36 +457,58 @@ $('#do-checkout').onclick = async (e) => {
     resetBill();
     showReceipt(sale);
   } catch (err) {
-    if (!err.offline) return toast(err.message, true);
-    // No internet: the sale has happened in the shop, so keep it and sync later.
-    const created_at = new Date().toISOString();
+    if (!err.offline) {
+      voidNumber(invoice_no, `Not issued: ${err.message}`);
+      return toast(err.message, true);
+    }
+    // No internet: the sale has happened in the shop, so keep it and sync later. The invoice is
+    // worked out here exactly as the server will record it, and each line is sent as printed.
+    const preview = invoicePreview({ lines, discount, payment_method, customer_name, customer_phone, buyer_gstin, buyer_address, place_of_supply, invoice_no });
     await enqueue({
       kind: 'sale',
       path: '/sales',
-      body: { ...body, offline: true, created_at },
-      label: `Bill ${rupees(total)} · ${PAY_LABEL[payment_method]}${customer_name ? ' · ' + customer_name : ''}`,
-      preview: {
-        id: null, subtotal, discount, total, tax: 0, payment_method, customer_name, customer_phone,
-        created_at: nowSql(),
-        items: lines.map(({ product: p, quantity }) => ({
-          name: p.name, quantity, unit_price: p.price, line_total: p.price * quantity,
-        })),
+      body: {
+        ...body, offline: true, created_at: new Date().toISOString(),
+        items: preview.items.map((i) => ({ barcode: i.barcode, quantity: i.quantity, unit_price: i.unit_price, gst_rate: i.gst_rate, hsn: i.hsn ?? undefined, unit: i.unit })),
       },
+      label: `${invoice_no ?? 'Bill'} ${rupees(total)} · ${PAY_LABEL[payment_method]}${customer_name ? ' · ' + customer_name : ''}`,
+      preview,
     });
     for (const { product, quantity } of lines) await catalogChangeQty(product.barcode, -quantity);
-    const sale = (await getOutbox()).at(-1).preview;
     resetBill();
-    showReceipt(sale);
+    showReceipt(preview);
     toast('Saved offline — will sync when internet is back');
   } finally {
     btn.disabled = false;
   }
 };
 
+// The invoice as the server will record it, for printing while offline.
+function invoicePreview({ lines, discount, payment_method, customer_name, customer_phone, buyer_gstin, buyer_address, place_of_supply, invoice_no }) {
+  const pos = place_of_supply ?? shop.state_code ?? null;
+  const inter = Boolean(gstOn() && pos && pos !== shop.state_code);
+  const items = lines.map(({ product: p, quantity }) => ({
+    barcode: p.barcode, name: p.name, quantity, unit_price: p.price, line_total: p.price * quantity,
+    gst_rate: p.gst_rate, hsn: p.hsn ?? null, unit: p.unit ?? 'NOS',
+  }));
+  const split = splitTax(items.map((i) => ({ amount: i.line_total, rate: i.gst_rate })), discount, inter);
+  items.forEach((i, n) => {
+    const { taxable, cgst, sgst, igst } = split[n];
+    Object.assign(i, { taxable, cgst, sgst, igst });
+  });
+  const subtotal = items.reduce((t, i) => t + i.line_total, 0);
+  const sum = (k) => items.reduce((t, i) => t + i[k], 0);
+  return {
+    id: null, invoice_no, created_at: nowSql(), subtotal, discount, total: subtotal - discount, payment_method,
+    customer_name, customer_phone, buyer_gstin, buyer_address, place_of_supply: pos, inter_state: inter ? 1 : 0,
+    taxable: sum('taxable'), cgst: sum('cgst'), sgst: sum('sgst'), igst: sum('igst'), tax: sum('cgst') + sum('sgst') + sum('igst'), items,
+  };
+}
+
 function receiptText(sale) {
   const lines = sale.items.map((i) => `${i.name} x${i.quantity} = ${rupees(i.line_total)}`);
   return [
-    `${SHOP_NAME} — Bill${sale.id ? ' #' + sale.id : ''}`,
+    `${shopName()} — ${gstOn() ? 'Tax invoice' : 'Bill'} ${sale.invoice_no ?? (sale.id ? '#' + sale.id : '')}`.trim(),
     localTime(sale.created_at),
     '',
     ...lines,
@@ -402,21 +525,11 @@ function whatsappLink(phone, text) {
 }
 
 function showReceipt(sale) {
-  openModal(`
-    <div class="receipt">
-      <h3>${esc(SHOP_NAME)}</h3>
-      <div>${sale.id ? `Bill #${sale.id}` : 'Bill (saved offline, syncs later)'} · ${localTime(sale.created_at)}</div>
-      ${sale.customer_name ? `<div>Customer: ${esc(sale.customer_name)}</div>` : ''}
-      <table>
-        ${sale.items.map((i) => `<tr><td>${esc(i.name)}<br><span class="muted">${i.quantity} × ${rupees(i.unit_price)}</span></td><td>${rupees(i.line_total)}</td></tr>`).join('')}
-        <tr class="sep"><td>Subtotal</td><td>${rupees(sale.subtotal)}</td></tr>
-        ${sale.discount ? `<tr><td>Discount</td><td>−${rupees(sale.discount)}</td></tr>` : ''}
-        <tr><td><strong>Total</strong></td><td><strong>${rupees(sale.total)}</strong></td></tr>
-        ${sale.tax ? `<tr><td class="muted">Incl. GST</td><td class="muted">${rupees(sale.tax)}</td></tr>` : ''}
-        <tr><td>Paid by</td><td>${PAY_LABEL[sale.payment_method]}</td></tr>
-        ${(sale.returns ?? []).map((r) => `<tr><td class="muted">Returned ${localTime(r.created_at)}</td><td class="muted">−${rupees(r.total)}</td></tr>`).join('')}
-      </table>
-    </div>
+  const returned = (sale.returns ?? []).map((r) => `<div class="muted">Credit note ${esc(r.note_no ?? '#' + r.id)} · ${localTime(r.created_at)} · −${rupees(r.total)}</div>`).join('');
+  const body = gstOn() && (sale.invoice_no || !sale.id)
+    ? taxInvoiceHtml(sale, shop, { pending: !sale.id }) + returned
+    : plainReceiptHtml(sale);
+  openModal(`${body}
     <div class="actions">
       <button class="btn ghost" data-close>Close</button>
       ${sale.id ? '<button class="btn" data-return>↩ Return</button>' : ''}
@@ -432,6 +545,25 @@ function showReceipt(sale) {
     setBillMode('return');
     loadReturnBill(sale.id);
   };
+}
+
+// The simple bill, for shops that are not GST-registered (and bills from before registration).
+function plainReceiptHtml(sale) {
+  return `
+    <div class="receipt">
+      <h3>${esc(shopName())}</h3>
+      <div>${sale.invoice_no ? `Bill ${esc(sale.invoice_no)}` : sale.id ? `Bill #${sale.id}` : 'Bill (saved offline, syncs later)'} · ${localTime(sale.created_at)}</div>
+      ${sale.customer_name ? `<div>Customer: ${esc(sale.customer_name)}</div>` : ''}
+      <table>
+        ${sale.items.map((i) => `<tr><td>${esc(i.name)}<br><span class="muted">${i.quantity} × ${rupees(i.unit_price)}</span></td><td>${rupees(i.line_total)}</td></tr>`).join('')}
+        <tr class="sep"><td>Subtotal</td><td>${rupees(sale.subtotal)}</td></tr>
+        ${sale.discount ? `<tr><td>Discount</td><td>−${rupees(sale.discount)}</td></tr>` : ''}
+        <tr><td><strong>Total</strong></td><td><strong>${rupees(sale.total)}</strong></td></tr>
+        ${sale.tax ? `<tr><td class="muted">Incl. GST</td><td class="muted">${rupees(sale.tax)}</td></tr>` : ''}
+        <tr><td>Paid by</td><td>${PAY_LABEL[sale.payment_method]}</td></tr>
+        ${(sale.returns ?? []).map((r) => `<tr><td class="muted">Returned ${localTime(r.created_at)}</td><td class="muted">−${rupees(r.total)}</td></tr>`).join('')}
+      </table>
+    </div>`;
 }
 
 // --- customer returns ---------------------------------------------------
@@ -479,6 +611,7 @@ async function loadReturnBill(id) {
     sale,
     lines: new Map(sale.returnable.map((l) => [l.barcode, {
       barcode: l.barcode, name: l.name, quantity: 0, unit_price: l.unit_refund, max: l.returnable,
+      gst_rate: l.gst_rate, hsn: l.hsn, unit: l.unit,
     }])),
   };
   $('#return-bill-form').bill.value = sale.id;
@@ -496,6 +629,7 @@ $('#return-bill-form').onsubmit = (e) => {
 };
 
 async function addToReturn(barcode) {
+  if (!ret.sale && gstOn()) return toast('Load the bill first — a credit note must refer to the original invoice', true);
   if (ret.sale) {
     const line = ret.lines.get(barcode);
     if (!line) return toast(`That item is not on bill #${ret.sale.id}`, true);
@@ -572,42 +706,69 @@ $('#return-save').onclick = async (e) => {
   const customer_phone = needsCustomer ? $('#return-cust-phone').value.trim() || undefined : undefined;
   if (needsCustomer && !customer_name && !customer_phone) return toast('Enter the customer whose udhaar this comes off', true);
   const total = lines.reduce((t, l) => t + l.unit_price * l.quantity, 0);
+  if (gstOn() && !ret.sale) return toast('Load the bill first — a credit note must refer to the original invoice', true);
+  btn.disabled = true;
+  let note_no;
+  try {
+    if (gstOn()) note_no = await allocateNumber('credit_note');
+  } catch (err) {
+    btn.disabled = false;
+    return toast(err.message, true);
+  }
   const body = {
     sale_id: ret.sale?.id,
     items: lines.map((l) => ({ barcode: l.barcode, quantity: l.quantity })),
-    refund_method, restock, customer_name, customer_phone,
+    refund_method, restock, customer_name, customer_phone, note_no,
     reason: $('#return-why').value.trim() || undefined,
     client_id: newClientId(),
   };
   const who = ret.sale?.customer_name ?? customer_name ?? 'the customer';
-  const finish = async (offline) => {
+  const sale = ret.sale;
+  // The credit note as the server will record it, for printing while offline.
+  const notePreview = () => {
+    const inter = Boolean(sale?.inter_state);
+    const items = lines.map((l) => ({
+      name: l.name, hsn: l.hsn, unit: l.unit, gst_rate: l.gst_rate ?? 0, quantity: l.quantity, unit_price: l.unit_price,
+      ...taxOf(l.unit_price * l.quantity, l.gst_rate ?? 0, inter),
+    }));
+    return {
+      id: null, note_no, created_at: nowSql(), total, reason: body.reason, items, inter_state: sale?.inter_state,
+      invoice_no: sale?.invoice_no, invoice_date: sale?.created_at, buyer_gstin: sale?.buyer_gstin,
+      buyer_name: sale?.customer_name, buyer_address: sale?.buyer_address, place_of_supply: sale?.place_of_supply,
+    };
+  };
+  const finish = async (offline, note) => {
     if (restock) for (const l of lines) await catalogChangeQty(l.barcode, l.quantity);
     resetReturn();
     openModal(`
+      ${gstOn() && note ? creditNoteHtml(note, shop, { pending: offline }) : ''}
       <h2>Return saved${offline ? ' (offline)' : ''}</h2>
       <p style="font-size:20px"><strong>${refund_method === 'khata'
         ? `${rupees(total)} taken off ${esc(who)}'s udhaar`
         : `Give back ${rupees(total)} by ${PAY_LABEL[refund_method]}`}</strong></p>
       <p class="muted">${restock ? 'Items are back in stock.' : 'Marked damaged — not added back to stock.'}${offline ? ' Will sync when the internet is back.' : ''}</p>
-      <div class="actions"><button class="btn primary" data-close>Done</button></div>`);
+      <div class="actions">${gstOn() ? '<button class="btn" data-print>Print credit note</button>' : ''}<button class="btn primary" data-close>Done</button></div>`);
     $('[data-close]', modal).onclick = () => modal.close();
+    $('[data-print]', modal)?.addEventListener('click', () => window.print());
   };
 
-  btn.disabled = true;
   try {
     if ((await getOutbox()).length) await trySync();
-    await api('/sale-returns', { method: 'POST', body });
+    const note = await api('/sale-returns', { method: 'POST', body });
     if (refund_method === 'khata') cachedGet('/customers').then(fillCustomerList, () => {});
-    await finish(false);
+    await finish(false, note);
   } catch (err) {
-    if (!err.offline) return toast(err.message, true);
+    if (!err.offline) {
+      voidNumber(note_no, `Not issued: ${err.message}`);
+      return toast(err.message, true);
+    }
     await enqueue({
       kind: 'sale_return', path: '/sale-returns',
       body: { ...body, created_at: new Date().toISOString() },
       label: `Customer return ${rupees(total)}${who !== 'the customer' ? ' · ' + who : ''}`,
       preview: { total, refund_method, customer_id: ret.sale?.customer_id ?? null, customer_name, customer_phone },
     });
-    await finish(true);
+    await finish(true, notePreview());
   } finally {
     btn.disabled = false;
   }
@@ -850,7 +1011,7 @@ $('#purchase-save').onclick = async (e) => {
     invoice_no: $('#purchase-invoice').value.trim() || undefined,
     items: purchase.lines.map((l) => ({
       barcode: l.barcode, quantity: l.quantity, unit_cost: l.unit_cost,
-      ...(l.isNew && { name: l.name, price: l.price, gst_rate: l.gst_rate, low_stock: l.low_stock }),
+      ...(l.isNew && { name: l.name, price: l.price, gst_rate: l.gst_rate, low_stock: l.low_stock, hsn: l.hsn, unit: l.unit }),
     })),
     paid,
     payment_method: $('input[name=pmethod]:checked').value,
@@ -883,7 +1044,7 @@ $('#purchase-save').onclick = async (e) => {
     });
     for (const l of purchase.lines) {
       if (l.isNew) {
-        await catalogUpsert({ id: null, barcode: l.barcode, name: l.name, price: l.price, cost: l.unit_cost,
+        await catalogUpsert({ id: null, barcode: l.barcode, name: l.name, price: l.price, cost: l.unit_cost, hsn: l.hsn, unit: l.unit,
           gst_rate: l.gst_rate, low_stock: l.low_stock, quantity: l.quantity });
       } else {
         await catalogChangeQty(l.barcode, l.quantity);
@@ -976,6 +1137,7 @@ function addPurchaseLine(f) {
   } else {
     purchase.lines.push(f.dataset.mode === 'new'
       ? { barcode, quantity, unit_cost, isNew: true, name: f.name.value.trim(), price: toPaise(f.price.value),
+          hsn: f.hsn.value.trim() || undefined, unit: f.unit.value,
           gst_rate: Number(f.gst_rate.value), low_stock: parseInt(f.low_stock.value, 10) || 0 }
       : { barcode, quantity, unit_cost, isNew: false, name: stockProduct.name });
   }
@@ -998,6 +1160,8 @@ stockForm.onsubmit = async (e) => {
       cost: toPaise(f.cost.value),
       gst_rate: Number(f.gst_rate.value),
       low_stock: parseInt(f.low_stock.value, 10) || 0,
+      hsn: f.hsn.value.trim() || undefined,
+      unit: f.unit.value,
     });
   }
   try {
@@ -1013,7 +1177,7 @@ stockForm.onsubmit = async (e) => {
     // Make the product sellable on this phone right away.
     await catalogUpsert(stockProduct
       ? { ...stockProduct, cached: undefined, quantity: stockProduct.quantity + body.quantity }
-      : { id: null, barcode: body.barcode, name: body.name, price: body.price, cost: body.cost, gst_rate: body.gst_rate,
+      : { id: null, barcode: body.barcode, name: body.name, price: body.price, cost: body.cost, gst_rate: body.gst_rate, hsn: body.hsn, unit: body.unit,
           low_stock: body.low_stock, quantity: body.quantity });
     toast(`Saved offline: ${name} +${body.quantity}`);
     closeStockForm();
@@ -1075,9 +1239,12 @@ async function editProduct(id) {
       <div class="grid2">
         <label>Selling price ₹<input name="price" type="number" step="0.01" min="0" value="${p.price / 100}" required></label>
         <label>Cost price ₹<input name="cost" type="number" step="0.01" min="0" value="${p.cost / 100}"></label>
-        <label>GST %<input name="gst_rate" type="number" min="0" max="100" step="0.01" value="${p.gst_rate}"></label>
+        <label>GST %<select name="gst_rate" data-gst-rates data-value="${GST_RATES.includes(p.gst_rate) ? p.gst_rate : ''}"></select></label>
         <label>Low-stock alert<input name="low_stock" type="number" min="0" value="${p.low_stock}"></label>
+        <label>HSN code<input name="hsn" inputmode="numeric" maxlength="8" value="${esc(p.hsn ?? '')}" placeholder="e.g. 0902"></label>
+        <label>Unit<select name="unit" data-units data-value="${esc(p.unit ?? 'NOS')}"></select></label>
       </div>
+      ${GST_RATES.includes(p.gst_rate) ? '' : `<p class="notice">${p.gst_rate}% is no longer a GST rate. Pick the current rate for this item.</p>`}
       <label>Correct stock (damaged, lost, recount): + or − units
         <input name="change" type="number" step="1" placeholder="e.g. -2"></label>
       <div class="actions">
@@ -1091,6 +1258,7 @@ async function editProduct(id) {
         <strong>${m.change > 0 ? '+' : ''}${m.change}</strong></li>`).join('')}</ul>
     </form>`);
   const form = $('#edit-form');
+  fillPickers(form);
   $('[data-close]', form).onclick = () => modal.close();
   form.onsubmit = async (e) => {
     e.preventDefault();
@@ -1103,6 +1271,8 @@ async function editProduct(id) {
           cost: toPaise(form.cost.value),
           gst_rate: Number(form.gst_rate.value) || 0,
           low_stock: parseInt(form.low_stock.value, 10) || 0,
+          hsn: form.hsn.value.trim(),
+          unit: form.unit.value,
         },
       });
       const change = parseInt(form.change.value, 10);
@@ -1283,7 +1453,7 @@ async function openParty(sideKey, id) {
   }
   const balance = c.balance + (await pendingBalanceDelta(sideKey, c));
   const invoices = Object.fromEntries((c.purchases ?? []).map((p) => [p.id, p.invoice_no]));
-  const reminder = `Hello ${c.name}, this is a reminder from ${SHOP_NAME} that ${rupees(balance)} is due. Thank you!`;
+  const reminder = `Hello ${c.name}, this is a reminder from ${shopName()} that ${rupees(balance)} is due. Thank you!`;
   const contact = !c.phone || balance <= 0 ? ''
     : sideKey === 'customer'
       ? `<a class="btn" href="${whatsappLink(c.phone, reminder)}" target="_blank" rel="noopener">Remind</a>`
@@ -1446,9 +1616,77 @@ function loadReports() {
   $('#sales-panel').classList.toggle('hidden', reportSide !== 'sales');
   $('#profit-report').classList.toggle('hidden', reportSide !== 'profit');
   $('#supplier-report').classList.toggle('hidden', reportSide !== 'suppliers');
-  $('#report-toolbar').classList.toggle('hidden', reportSide === 'sales');
-  return { sales: loadSales, profit: loadProfit, suppliers: loadSupplierReport }[reportSide]();
+  $('#gst-report').classList.toggle('hidden', reportSide !== 'gst');
+  $('#report-toolbar').classList.toggle('hidden', reportSide === 'sales' || reportSide === 'gst');
+  return { sales: loadSales, profit: loadProfit, suppliers: loadSupplierReport, gst: loadGst }[reportSide]();
 }
+
+// --- GSTR-1 ---------------------------------------------------------------
+
+const GST_SECTIONS = [
+  ['b2b', 'B2B invoices', 'Sales to GST-registered buyers, invoice by invoice'],
+  ['b2cl', 'B2C large', 'Inter-state sales to unregistered buyers above ₹1 lakh'],
+  ['b2cs', 'B2C small', 'All other sales, by state and rate (net of credit notes)'],
+  ['cdnr', 'Credit notes — registered', 'Returns against B2B invoices'],
+  ['cdnur', 'Credit notes — unregistered', 'Returns against B2C large invoices'],
+  ['hsn_b2b', 'HSN summary — B2B', 'Table 12, B2B tab'],
+  ['hsn_b2c', 'HSN summary — B2C', 'Table 12, B2C tab'],
+  ['docs', 'Documents issued', 'Table 13: number ranges and cancelled'],
+];
+
+function fillGstMonths() {
+  const sel = $('#gst-month');
+  if (sel.options.length) return;
+  const now = new Date();
+  for (let i = 0; i < 13; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const v = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    sel.add(new Option(d.toLocaleString('en-IN', { month: 'long', year: 'numeric' }), v));
+  }
+  // Returns are filed for the month gone by.
+  sel.selectedIndex = now.getDate() <= 11 ? 1 : 0;
+}
+
+let gstData = null;
+async function loadGst() {
+  fillGstMonths();
+  let stale;
+  try {
+    ({ data: gstData, stale } = await cachedGet('/reports/gstr1?month=' + $('#gst-month').value));
+  } catch (err) {
+    return toast(err.message, true);
+  }
+  if (!gstData) {
+    $('#gst-totals').innerHTML = OFFLINE_NOTE;
+    $('#gst-sections').innerHTML = '';
+    return;
+  }
+  const t = gstData.summary;
+  $('#gst-totals').innerHTML = (stale ? OFFLINE_NOTE : '') + (gstData.registered ? '' : '<p class="notice">GST registration is off in Settings, so these bills are not tax invoices.</p>') + `
+    <div><strong>${rupees(t.taxable)}</strong><span>Taxable value (${t.invoices} invoice${t.invoices === 1 ? '' : 's'}, ${t.credit_notes} credit note${t.credit_notes === 1 ? '' : 's'})</span></div>
+    <div><strong>${rupees(t.tax)}</strong><span>Output tax</span></div>
+    <div><strong>${rupees(t.cgst)} + ${rupees(t.sgst)}</strong><span>CGST + SGST</span></div>
+    <div><strong>${rupees(t.igst)}</strong><span>IGST</span></div>`;
+  $('#gst-warnings').innerHTML = gstData.warnings.map((w) => `<p class="notice">${esc(w)}</p>`).join('');
+  $('#gst-sections').innerHTML = GST_SECTIONS.map(([key, title, help]) => {
+    const rows = gstData[key];
+    return `<li>
+      <div class="grow"><div class="title">${title} <span class="badge">${rows.length} row${rows.length === 1 ? '' : 's'}</span></div>
+        <div class="sub">${help}</div></div>
+      <button class="btn" data-gst-csv="${key}" ${rows.length ? '' : 'disabled'}>CSV</button>
+    </li>`;
+  }).join('');
+}
+$('#gst-month').onchange = loadGst;
+$('#gst-sections').onclick = (e) => {
+  const key = e.target.dataset.gstCsv;
+  if (key) downloadFile(`/reports/gstr1?month=${$('#gst-month').value}&section=${key}&format=csv`);
+};
+$('#gst-csv-all').onclick = async () => {
+  for (const [key] of GST_SECTIONS) {
+    if (gstData?.[key]?.length) await downloadFile(`/reports/gstr1?month=${$('#gst-month').value}&section=${key}&format=csv`);
+  }
+};
 
 // --- profit report ------------------------------------------------------
 
@@ -1570,8 +1808,8 @@ $('#report-list').onclick = (e) => {
 };
 $('#report-csv').onclick = () => {
   const range = periodRange($('#report-period').value);
-  if (reportSide === 'profit') return downloadCsv(profitPath(range) + '&format=csv', range.tag);
-  downloadCsv('/reports/suppliers?format=csv&' + periodQuery(range), range.tag);
+  if (reportSide === 'profit') return downloadFile(profitPath(range) + '&format=csv', range.tag);
+  downloadFile('/reports/suppliers?format=csv&' + periodQuery(range), range.tag);
 };
 
 async function openSupplierReport(id, range) {
@@ -1602,12 +1840,12 @@ async function openSupplierReport(id, range) {
       <button class="btn" data-csv>⬇ CSV</button>
     </div>`);
   $('[data-close]', modal).onclick = () => modal.close();
-  $('[data-csv]', modal).onclick = () => downloadCsv(`/reports/suppliers/${id}?format=csv&${periodQuery(range)}`, range.tag);
+  $('[data-csv]', modal).onclick = () => downloadFile(`/reports/suppliers/${id}?format=csv&${periodQuery(range)}`, range.tag);
 }
 
-// Fetch (so the shop PIN header is sent) and hand the file to the browser.
+// Fetch (so the shop PIN header is sent) and hand the file (CSV, backup) to the browser.
 // `tag` swaps the server's UTC dates in the file name for the shop's local ones.
-async function downloadCsv(path, tag) {
+async function downloadFile(path, tag) {
   try {
     const res = await fetch('/api' + path, { headers: { 'x-hisaab-pin': localStorage.getItem('hisaab.pin') ?? '' } });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Download failed');
@@ -1622,6 +1860,93 @@ async function downloadCsv(path, tag) {
   } catch (err) {
     toast(err instanceof TypeError ? 'Downloading needs internet' : err.message, true);
   }
+}
+
+// --- settings -----------------------------------------------------------
+
+async function openSettings() {
+  await loadShop();
+  const device = await kvGet('device');
+  openModal(`
+    <form id="settings-form">
+      <h2>Shop settings</h2>
+      <label class="chip"><input type="checkbox" name="gst_registered" ${shop.gst_registered ? 'checked' : ''}> Registered under GST (regular) — issue tax invoices</label>
+      <label>GSTIN<input name="gstin" value="${esc(shop.gstin)}" maxlength="15" autocapitalize="characters" autocomplete="off"></label>
+      <label>Legal name (as on GST registration)<input name="legal_name" value="${esc(shop.legal_name)}"></label>
+      <label>Shop name on bills (trade name)<input name="trade_name" value="${esc(shop.trade_name)}"></label>
+      <label>Address<input name="address" value="${esc(shop.address)}"></label>
+      <div class="grid2">
+        <label>Phone<input name="phone" value="${esc(shop.phone)}" inputmode="tel"></label>
+        <label>Email<input name="email" value="${esc(shop.email)}" inputmode="email"></label>
+      </div>
+      <label>Last year's turnover
+        <select name="hsn_digits">
+          <option value="4" ${shop.hsn_digits === 4 ? 'selected' : ''}>Up to ₹5 crore — 4-digit HSN, needed on B2B invoices</option>
+          <option value="6" ${shop.hsn_digits === 6 ? 'selected' : ''}>Above ₹5 crore — 6-digit HSN on every invoice</option>
+        </select></label>
+      <label>Terms printed on invoices (optional)<input name="invoice_terms" value="${esc(shop.invoice_terms)}" placeholder="e.g. Goods once sold will be exchanged within 7 days"></label>
+      <div class="actions">
+        <button class="btn ghost" type="button" data-close>Close</button>
+        <button class="btn primary">Save</button>
+      </div>
+      <div class="settings-section">
+        <p class="muted">This phone's invoice series: <strong>${device ? esc(device.code) : 'not set up yet — connect to the internet once'}</strong>.
+          Invoices from it look like ${device ? esc(invoiceNumber(device.code, financialYear(localDate(nowSql(), shop.tz_offset)).short, 1)) : '—'}.</p>
+        <p class="muted">A backup is saved on the server every day. Download a copy regularly and keep it somewhere else.</p>
+        <div class="actions">
+          <button class="btn" type="button" data-backup>⬇ Download backup</button>
+          <button class="btn" type="button" data-audit>Change log</button>
+        </div>
+      </div>
+    </form>`);
+  const form = $('#settings-form');
+  $('[data-close]', form).onclick = () => modal.close();
+  $('[data-backup]', form).onclick = () => downloadFile('/backup');
+  $('[data-audit]', form).onclick = openAuditLog;
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const gstin = form.gstin.value.trim().toUpperCase();
+    if (gstin && !gstinValid(gstin)) return toast('That GSTIN is not valid — check for a typo', true);
+    try {
+      shop = await api('/settings', {
+        method: 'PUT',
+        body: {
+          gst_registered: form.gst_registered.checked, gstin, legal_name: form.legal_name.value.trim() || undefined,
+          trade_name: form.trade_name.value.trim(), address: form.address.value.trim() || undefined,
+          phone: form.phone.value.trim(), email: form.email.value.trim(),
+          hsn_digits: Number(form.hsn_digits.value), invoice_terms: form.invoice_terms.value.trim(),
+        },
+      });
+      await kvSet('get:/settings', shop);
+      await loadShop();
+      fillPickers();
+      modal.close();
+      toast('Settings saved');
+    } catch (err) {
+      toast(err.offline ? 'Saving settings needs internet' : err.message, true);
+    }
+  };
+}
+
+// Rule 56(8): the log of edits to products, settings and voided numbers.
+async function openAuditLog() {
+  let rows;
+  try {
+    rows = await api('/audit-log?limit=200');
+  } catch (err) {
+    return toast(err.offline ? 'The change log needs internet' : err.message, true);
+  }
+  const what = (r) => r.changes
+    ? Object.entries(r.changes).map(([k, v]) => Array.isArray(v) ? `${k}: ${JSON.stringify(v[0])} → ${JSON.stringify(v[1])}` : `${k}: ${JSON.stringify(v)}`).join(', ')
+    : '';
+  openModal(`
+    <h2>Change log</h2>
+    <p class="muted">Every edit to products and settings, and every invoice number that was never issued. Bills, purchases, payments and returns are never edited; corrections are new entries.</p>
+    <ul class="list">${rows.map((r) => `<li class="audit-row"><div class="grow">
+      <div><strong>${esc(r.entity)}${r.entity_id ? ' #' + r.entity_id : ''}</strong> · ${esc(r.action)}</div>
+      <div class="sub">${localTime(r.created_at)} · ${esc(what(r))}</div></div></li>`).join('') || '<p class="empty">No changes yet.</p>'}</ul>
+    <div class="actions"><button class="btn primary" data-close>Close</button></div>`);
+  $('[data-close]', modal).onclick = () => modal.close();
 }
 
 // --- navigation ---------------------------------------------------------
@@ -1650,20 +1975,18 @@ document.addEventListener('visibilitychange', () => document.hidden && stopAllSc
 
 setupScanner('bill', (code) => (billMode === 'return' ? addToReturn(code) : addToCart(code)));
 setupScanner('stock', startStockIn);
-$('#shop-status').textContent = SHOP_NAME;
-$('#shop-status').onclick = () => {
-  const name = prompt('Shop name (printed on bills)', SHOP_NAME);
-  if (name?.trim()) {
-    localStorage.setItem('hisaab.shop', name.trim());
-    location.reload();
-  }
-};
+$('#shop-status').textContent = shopName();
+$('#shop-status').onclick = openSettings;
+fillPickers();
 renderCart();
 renderPurchase();
 renderSyncStatus();
 
 // Warm the offline copies: catalog for scanning, customers for udhaar suggestions.
 (async () => {
+  await loadShop();
+  fillPickers();
+  await ensureDevice();
   await trySync();
   await refreshCatalog();
   await cachedGet('/customers').catch(() => {});
