@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f766e">
+  <title>Hisaab</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Hisaab</h1>
+    <button id="sync-status" class="sync-chip hidden" title="Offline queue"></button>
+    <button id="shop-status" class="muted shop-name" title="Settings"></button>
+  </header>
+
+  <!-- Sign-in, shown once logins are set up -->
+  <div id="login-screen" class="login hidden">
+    <form id="login-form" class="card" autocomplete="on">
+      <h1>Hisaab</h1>
+      <p id="login-shop" class="muted"></p>
+      <label>Username<input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+      <label>PIN<input name="pin" type="password" inputmode="numeric" pattern="\d*" autocomplete="current-password" required></label>
+      <p id="login-error" class="notice hidden"></p>
+      <button class="btn primary wide">Sign in</button>
+    </form>
+  </div>
+
+  <main>
+    <!-- Billing -->
+    <section id="view-bill" class="view active">
+      <div class="segmented" id="bill-mode" role="tablist">
+        <button data-mode="sale" class="active" role="tab">New sale</button>
+        <button data-mode="return" role="tab">Customer return</button>
+      </div>
+      <div class="scanner" data-scanner="bill">
+        <video playsinline muted></video>
+        <div class="scan-frame"></div>
+        <button class="scan-toggle btn">Start camera</button>
+      </div>
+      <form class="manual" data-manual="bill">
+        <input name="code" placeholder="Type or scan barcode" inputmode="numeric" autocomplete="off">
+        <button class="btn">Add</button>
+      </form>
+
+      <div id="return-panel" class="hidden">
+        <form id="return-bill-form" class="manual">
+          <input name="bill" placeholder="Bill or invoice number from the receipt" autocomplete="off" autocapitalize="characters">
+          <button class="btn">Load bill</button>
+        </form>
+        <p id="return-limit" class="notice hidden"></p>
+        <p id="return-bill-info" class="muted"></p>
+        <ul id="return-lines" class="list"></ul>
+        <p id="return-empty" class="empty">Load the customer's bill, or just scan what they brought back.</p>
+        <div id="return-checkout" class="card hidden">
+          <div class="row total"><span>Refund</span><strong id="return-total">₹0.00</strong></div>
+          <label class="chip"><input type="checkbox" id="return-restock" checked> Put back in stock (untick if damaged)</label>
+          <div class="pay-methods" id="return-refund">
+            <label><input type="radio" name="refund" value="cash" checked> Cash</label>
+            <label><input type="radio" name="refund" value="upi"> UPI</label>
+            <label><input type="radio" name="refund" value="card"> Card</label>
+            <label><input type="radio" name="refund" value="khata"> Off udhaar</label>
+          </div>
+          <div id="return-customer" class="hidden">
+            <input id="return-cust-name" placeholder="Customer name" list="customer-names" autocomplete="off">
+            <input id="return-cust-phone" placeholder="Customer phone" inputmode="tel" autocomplete="off">
+          </div>
+          <input id="return-why" placeholder="Reason (optional)" autocomplete="off">
+          <div class="actions">
+            <button id="return-clear" class="btn ghost" type="button">Clear</button>
+            <button id="return-save" class="btn primary" type="button">Complete return</button>
+          </div>
+        </div>
+      </div>
+
+      <ul id="cart" class="list"></ul>
+      <p id="cart-empty" class="empty">Scan an item to start a bill.</p>
+
+      <div id="checkout" class="card hidden">
+        <div class="row"><span>Subtotal</span><strong id="subtotal">₹0.00</strong></div>
+        <label class="row"><span>Discount (₹)</span><input id="discount" type="number" min="0" step="0.01" value="0" inputmode="decimal"></label>
+        <div class="row total"><span>Total</span><strong id="total">₹0.00</strong></div>
+        <div class="pay-methods" role="radiogroup">
+          <label><input type="radio" name="pay" value="cash" checked> Cash</label>
+          <label><input type="radio" name="pay" value="upi"> UPI</label>
+          <label><input type="radio" name="pay" value="card"> Card</label>
+          <label><input type="radio" name="pay" value="credit"> Udhaar</label>
+        </div>
+        <input id="cust-name" placeholder="Customer name (optional)" list="customer-names" autocomplete="off">
+        <input id="cust-phone" placeholder="Customer phone (optional)" inputmode="tel" autocomplete="off">
+        <datalist id="customer-names"></datalist>
+        <details id="tax-details" class="hidden">
+          <summary>Business buyer (GSTIN) or customer address</summary>
+          <input id="buyer-gstin" placeholder="Buyer GSTIN — makes this a B2B invoice" maxlength="15" autocomplete="off" autocapitalize="characters">
+          <input id="buyer-address" placeholder="Buyer address" autocomplete="off">
+          <label>Place of supply<select id="place-of-supply" data-states></select></label>
+          <p class="muted" id="tax-hint">Goods handed over at your counter are supplied in your state. Change this only if you deliver to another state.</p>
+        </details>
+        <p id="cust-due" class="muted hidden"></p>
+        <div class="actions">
+          <button id="clear-cart" class="btn ghost" type="button">Clear</button>
+          <button id="do-checkout" class="btn primary" type="button">Complete sale</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Stock in -->
+    <section id="view-stock" class="view">
+      <label class="supplier-bar owner-only">Supplier
+        <select id="purchase-supplier"><option value="">Quick stock in (no supplier bill)</option></select>
+      </label>
+      <div class="scanner" data-scanner="stock">
+        <video playsinline muted></video>
+        <div class="scan-frame"></div>
+        <button class="scan-toggle btn">Start camera</button>
+      </div>
+      <form class="manual" data-manual="stock">
+        <input name="code" placeholder="Type or scan barcode" inputmode="numeric" autocomplete="off">
+        <button class="btn">Look up</button>
+      </form>
+
+      <form id="stock-form" class="card hidden">
+        <h2 id="stock-title"></h2>
+        <p id="stock-current" class="muted"></p>
+        <input type="hidden" name="barcode">
+        <div class="new-only">
+          <label>Name<input name="name" required autocomplete="off"></label>
+          <div class="grid2">
+            <label>Selling price ₹<input name="price" type="number" min="0" step="0.01" inputmode="decimal" required></label>
+            <label class="quick-only">Cost price ₹<input name="cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
+            <label>GST %<select name="gst_rate" data-gst-rates></select></label>
+            <label>Low-stock alert at<input name="low_stock" type="number" min="0" value="5" inputmode="numeric"></label>
+            <label>HSN code<input name="hsn" inputmode="numeric" pattern="\d{4}(\d{2}){0,2}" maxlength="8" placeholder="e.g. 0902" autocomplete="off"></label>
+            <label>Unit<select name="unit" data-units></select></label>
+          </div>
+        </div>
+        <div class="grid2">
+          <label><span id="qty-label">Quantity to add</span><input name="quantity" type="number" min="1" value="1" inputmode="numeric" required></label>
+          <label class="purchase-only">Cost per unit ₹<input name="unit_cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
+        </div>
+        <div class="actions">
+          <button class="btn ghost" type="button" id="stock-cancel">Cancel</button>
+          <button class="btn primary" id="stock-submit">Add to stock</button>
+        </div>
+      </form>
+
+      <div id="purchase" class="card hidden">
+        <div class="segmented" id="purchase-mode" role="tablist">
+          <button data-mode="purchase" class="active" role="tab">Purchase bill</button>
+          <button data-mode="return" role="tab">Return to supplier</button>
+        </div>
+        <h2 id="purchase-title">Supplier bill</h2>
+        <label class="return-only">Against bill (optional)
+          <select id="return-bill"><option value="">Not linked to a bill</option></select></label>
+        <ul id="purchase-lines" class="list"></ul>
+        <p id="purchase-empty" class="empty">Scan each item on the supplier's bill.</p>
+        <div class="row total"><span id="purchase-total-label">Bill total</span><strong id="purchase-total">₹0.00</strong></div>
+        <div class="return-only">
+          <div class="pay-methods" id="return-settlement">
+            <label><input type="radio" name="settle" value="adjust" checked> Reduce what I owe</label>
+            <label><input type="radio" name="settle" value="refund"> Got cash back</label>
+          </div>
+          <div class="pay-methods hidden" id="refund-method">
+            <label><input type="radio" name="rmethod" value="cash" checked> Cash</label>
+            <label><input type="radio" name="rmethod" value="upi"> UPI</label>
+            <label><input type="radio" name="rmethod" value="bank"> Bank</label>
+            <label><input type="radio" name="rmethod" value="cheque"> Cheque</label>
+          </div>
+          <label>Reason (optional)<input id="return-reason" placeholder="Damaged, expired, wrong item…" autocomplete="off"></label>
+        </div>
+        <div class="buy-only">
+        <label>Supplier invoice no. (optional)<input id="purchase-invoice" autocomplete="off"></label>
+        <label>Paid now ₹<input id="purchase-paid" type="number" min="0" step="0.01" value="0" inputmode="decimal"></label>
+        <div class="pay-methods" id="purchase-method">
+          <label><input type="radio" name="pmethod" value="cash" checked> Cash</label>
+          <label><input type="radio" name="pmethod" value="upi"> UPI</label>
+          <label><input type="radio" name="pmethod" value="bank"> Bank</label>
+          <label><input type="radio" name="pmethod" value="cheque"> Cheque</label>
+        </div>
+        </div>
+        <p id="purchase-due" class="muted"></p>
+        <div class="actions">
+          <button class="btn ghost" type="button" id="purchase-discard">Discard</button>
+          <button class="btn primary" type="button" id="purchase-save">Save purchase</button>
+        </div>
+      </div>
+      <p class="empty" id="stock-hint"></p>
+    </section>
+
+    <!-- Inventory -->
+    <section id="view-inventory" class="view">
+      <div class="toolbar">
+        <input id="inv-search" type="search" placeholder="Search name or barcode">
+        <label class="chip"><input type="checkbox" id="inv-low"> Low stock</label>
+      </div>
+      <ul id="inv-list" class="list"></ul>
+    </section>
+
+    <!-- Khata: udhaar from customers, dues to suppliers -->
+    <section id="view-khata" class="view">
+      <div class="segmented owner-only" id="khata-side" role="tablist">
+        <button data-side="customer" class="active" role="tab">Customers owe you</button>
+        <button data-side="supplier" role="tab">You owe suppliers</button>
+      </div>
+      <div class="stats one"><div><strong id="khata-total">₹0.00</strong><span id="khata-total-label">Total udhaar outstanding</span></div></div>
+      <div class="toolbar">
+        <input id="khata-search" type="search" placeholder="Search name or phone">
+        <label class="chip"><input type="checkbox" id="khata-due-only" checked> Dues only</label>
+      </div>
+      <button id="add-party" class="btn wide" type="button">+ Add customer / opening balance</button>
+      <ul id="khata-list" class="list"></ul>
+    </section>
+
+    <!-- Sales -->
+    <section id="view-sales" class="view">
+      <div class="segmented owner-only" id="report-side" role="tablist">
+        <button data-side="sales" class="active" role="tab">Sales</button>
+        <button data-side="profit" role="tab">Profit</button>
+        <button data-side="suppliers" role="tab">Suppliers</button>
+        <button data-side="gst" role="tab">GST</button>
+      </div>
+      <div id="report-toolbar" class="toolbar hidden">
+        <select id="report-period">
+          <option value="month">This month</option>
+          <option value="last-month">Last month</option>
+          <option value="quarter">Last 3 months</option>
+          <option value="fy">This financial year (from 1 April)</option>
+          <option value="all">All time</option>
+        </select>
+        <button id="report-csv" class="btn" type="button">⬇ CSV</button>
+      </div>
+      <div id="sales-panel">
+        <div id="summary" class="stats"></div>
+        <h2>Recent bills</h2>
+        <ul id="sales-list" class="list"></ul>
+      </div>
+      <div id="profit-report" class="hidden">
+        <div id="profit-totals" class="stats"></div>
+        <p id="profit-warning" class="notice hidden"></p>
+        <h2>By day</h2>
+        <div id="profit-days" class="day-bars"></div>
+        <div class="toolbar">
+          <h2 class="grow-title">By product</h2>
+          <select id="profit-sort">
+            <option value="profit">Most profit</option>
+            <option value="margin-low">Lowest margin</option>
+            <option value="loss">Losing money</option>
+          </select>
+        </div>
+        <ul id="profit-list" class="list"></ul>
+      </div>
+      <div id="gst-report" class="hidden">
+        <div class="toolbar">
+          <select id="gst-month"></select>
+          <button id="gst-csv-all" class="btn" type="button">⬇ All CSVs</button>
+        </div>
+        <div id="gst-totals" class="stats"></div>
+        <div id="gst-warnings"></div>
+        <ul id="gst-sections" class="list"></ul>
+        <p class="muted">Files follow the GST offline tool's CSV layout. Check them with your CA before filing.</p>
+      </div>
+      <div id="supplier-report" class="hidden">
+        <div id="report-totals" class="stats"></div>
+        <ul id="report-list" class="list"></ul>
+      </div>
+    </section>
+  </main>
+
+  <nav class="tabs">
+    <button data-view="bill" class="active">🧾<span>Bill</span></button>
+    <button data-view="stock">📦<span>Stock in</span></button>
+    <button data-view="inventory">📋<span>Inventory</span></button>
+    <button data-view="khata">📒<span>Khata</span></button>
+    <button data-view="sales">📈<span>Reports</span></button>
+  </nav>
+
+  <dialog id="modal"><div id="modal-body"></div></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
