@@ -2058,9 +2058,9 @@ async function openSettings() {
       <div class="settings-section">
         <p class="muted">This phone's invoice series: <strong>${device ? esc(device.code) : 'not set up yet — connect to the internet once'}</strong>.
           Invoices from it look like ${device ? esc(invoiceNumber(device.code, financialYear(localDate(nowSql(), shop.tz_offset)).short, 1)) : '—'}.</p>
-        <p class="muted">A backup is saved on the server every day. Download a copy regularly and keep it somewhere else.</p>
+        <p id="backup-health" class="muted">Checking backups…</p>
         <div class="actions">
-          <button class="btn" type="button" data-backup>⬇ Download backup</button>
+          <button class="btn" type="button" data-backup>🛟 Backups</button>
           <button class="btn" type="button" data-audit>Change log</button>
         </div>
       </div>
@@ -2070,8 +2070,15 @@ async function openSettings() {
   $('[data-signout]', form)?.addEventListener('click', signOut);
   $('[data-people]', form)?.addEventListener('click', openPeople);
   $('[data-setup]', form)?.addEventListener('click', openOwnerSetup);
-  $('[data-backup]', form).onclick = () => downloadFile('/backup');
+  $('[data-backup]', form).onclick = openBackups;
   $('[data-audit]', form).onclick = openAuditLog;
+  api('/backup/config').then((b) => {
+    const el = $('#backup-health');
+    if (!el) return;
+    const problem = backupProblem(b);
+    el.className = problem ? 'notice' : 'muted';
+    el.textContent = problem ?? `Backed up ${localTime(b.status.offsite.last_ok_at.replace('T', ' ').slice(0, 19))}, encrypted and off-site.`;
+  }).catch(() => $('#backup-health')?.remove());
   form.onsubmit = async (e) => {
     e.preventDefault();
     const gstin = form.gstin.value.trim().toUpperCase();
@@ -2207,6 +2214,146 @@ async function openPeople() {
       toast('Saved');
       if (id === me?.id && (body.pin || body.role || body.active === false)) return showLogin('Your login changed — please sign in again');
       openPeople();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+}
+
+// --- backups ------------------------------------------------------------
+
+// What's wrong with the backups, if anything, in one sentence for the owner.
+function backupProblem(b) {
+  const lastOk = b.status?.offsite?.last_ok_at;
+  if (!b.passphrase_set) return 'Backups are not encrypted and not copied off this computer. Set them up under Backups.';
+  if (!b.destination) return 'Backups stay on this computer only — a theft, fire or failed disk would lose them. Add an off-site copy under Backups.';
+  if (b.status?.offsite && !b.status.offsite.ok) return `The last off-site backup failed: ${b.status.offsite.error}`;
+  if (!lastOk) return 'No off-site backup yet — press Back up now under Backups.';
+  if (Date.now() - Date.parse(lastOk) > 2 * 86_400_000) return `The last off-site backup was ${localTime(lastOk.replace('T', ' ').slice(0, 19))}. Check the server is running.`;
+  return null;
+}
+
+const DEST_FIELDS = {
+  s3: [
+    ['endpoint', 'Endpoint URL', 'e.g. https://<account-id>.r2.cloudflarestorage.com, https://s3.ap-south-1.amazonaws.com'],
+    ['region', 'Region', 'auto for Cloudflare R2; e.g. ap-south-1 for AWS Mumbai'],
+    ['bucket', 'Bucket', ''],
+    ['prefix', 'Folder in the bucket (optional)', 'e.g. sharma-stores'],
+    ['access_key', 'Access key ID', ''],
+    ['secret_key', 'Secret access key', '', true],
+  ],
+  webdav: [
+    ['url', 'Folder URL', 'e.g. https://cloud.example.com/remote.php/dav/files/you/Hisaab'],
+    ['username', 'Username', ''],
+    ['password', 'Password (an app password is best)', '', true],
+  ],
+  folder: [
+    ['path', 'Folder on the computer running Hisaab', 'e.g. a Google Drive, Dropbox or OneDrive folder, or a USB drive'],
+  ],
+};
+
+async function openBackups() {
+  let b;
+  try {
+    b = await api('/backup/config');
+  } catch (err) {
+    return toast(err.offline ? 'Backups need internet' : err.message, true);
+  }
+  const d = b.destination ?? {};
+  const when = (iso) => (iso ? localTime(iso.replace('T', ' ').slice(0, 19)) : '—');
+  const st = b.status ?? {};
+  const fieldsFor = (type) => (DEST_FIELDS[type] ?? []).map(([k, label, hint, secret]) => `
+    <label>${label}<input name="d_${k}" ${secret ? 'type="password" autocomplete="new-password"' : 'autocomplete="off"'}
+      value="${secret ? '' : esc(d.type === type ? d[k] ?? '' : '')}"
+      placeholder="${secret && d.type === type && d[`${k}_set`] ? 'saved — leave empty to keep' : esc(hint)}"></label>`).join('');
+  const problem = backupProblem(b);
+  openModal(`
+    <form id="backup-form">
+      <h2>Backups</h2>
+      ${problem ? `<p class="notice">${esc(problem)}</p>` : ''}
+      <div class="row"><span>Last backup</span><strong>${when(st.local?.at)}${st.local ? (st.local.encrypted ? ' · 🔒 encrypted' : ' · not encrypted') : ''}</strong></div>
+      <div class="row"><span>Last off-site copy</span><strong>${st.offsite ? (st.offsite.ok ? `✓ ${when(st.offsite.at)}` : `✗ failed ${when(st.offsite.at)}`) : '—'}</strong></div>
+      ${st.offsite?.ok ? `<p class="muted">Sent to ${esc(st.offsite.where)}</p>` : ''}
+
+      <div class="settings-section">
+        <h2>1. Passphrase</h2>
+        ${b.passphrase_from_server
+          ? '<p class="muted">Set on the server (HISAAB_BACKUP_PASSPHRASE).</p>'
+          : `<p class="muted">Backups are locked with this passphrase. <strong>Write it down and keep it safe</strong> — without it nobody can open the backups, not even us. ${b.passphrase_set ? 'Leave empty to keep the current one.' : ''}</p>
+             <label>${b.passphrase_set ? 'New passphrase' : 'Passphrase'} (12+ characters — a short sentence is easy to remember)
+               <input name="pass" type="password" autocomplete="new-password" minlength="12"></label>
+             <label>Same passphrase again<input name="pass2" type="password" autocomplete="new-password"></label>`}
+      </div>
+
+      <div class="settings-section">
+        <h2>2. Off-site copy</h2>
+        <label>Send each day's backup to
+          <select name="type">
+            <option value="">Nowhere — keep on this computer only</option>
+            <option value="s3" ${d.type === 's3' ? 'selected' : ''}>Cloud storage (Cloudflare R2, Backblaze B2, Wasabi, AWS S3)</option>
+            <option value="webdav" ${d.type === 'webdav' ? 'selected' : ''}>Nextcloud / WebDAV</option>
+            <option value="folder" ${d.type === 'folder' ? 'selected' : ''}>A synced folder or USB drive</option>
+          </select></label>
+        <div id="dest-fields">${fieldsFor(d.type)}</div>
+        <p class="muted">Only encrypted backups ever leave this computer.</p>
+      </div>
+
+      <div class="actions">
+        <button class="btn ghost" type="button" data-close>Close</button>
+        <button class="btn primary">Save</button>
+      </div>
+      <div class="actions">
+        <button class="btn" type="button" data-run>Back up now</button>
+        <button class="btn" type="button" data-verify>Test restore</button>
+        <button class="btn" type="button" data-download>⬇ Download</button>
+      </div>
+    </form>`);
+  const form = $('#backup-form');
+  form.type.onchange = () => ($('#dest-fields').innerHTML = fieldsFor(form.type.value));
+  $('[data-close]', form).onclick = () => modal.close();
+  $('[data-download]', form).onclick = () => downloadFile('/backup');
+  const busy = async (btn, label, fn) => {
+    const was = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = label;
+    try { await fn(); } finally { btn.disabled = false; btn.textContent = was; }
+  };
+  $('[data-run]', form).onclick = (e) => busy(e.target, 'Backing up…', async () => {
+    try {
+      const r = await api('/backup/run', { method: 'POST' });
+      const o = r.status.offsite;
+      toast(o && o.at === r.status.local.at ? (o.ok ? 'Backed up and copied off-site' : `Backed up here, but the off-site copy failed: ${o.error}`) : 'Backed up on this computer', o && !o.ok);
+      openBackups();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  $('[data-verify]', form).onclick = (e) => busy(e.target, 'Checking…', async () => {
+    try {
+      const r = await api('/backup/verify', { method: 'POST' });
+      toast(r.ok ? `✓ ${r.file} opens fine: ${r.sales} bills, ${r.products} products, ${r.customers} customers` : `Problem: ${r.integrity}`, !r.ok);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const body = {};
+    if (form.pass?.value) {
+      if (form.pass.value !== form.pass2.value) return toast('The two passphrases are different', true);
+      if (b.passphrase_set && !confirm('Change the passphrase? Backups made before stay locked with the old one — keep it written down too.')) return;
+      body.passphrase = form.pass.value;
+    }
+    if (form.type.value) {
+      body.destination = { type: form.type.value };
+      for (const [k] of DEST_FIELDS[form.type.value]) body.destination[k] = form[`d_${k}`].value.trim();
+    } else if (b.destination) {
+      body.destination = null;
+    }
+    try {
+      await api('/backup/config', { method: 'PUT', body });
+      toast('Backup settings saved');
+      openBackups();
     } catch (err) {
       toast(err.message, true);
     }

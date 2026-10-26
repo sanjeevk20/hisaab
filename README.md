@@ -71,7 +71,7 @@ Tap the shop name in the header → **Settings**, tick *Registered under GST (re
 
 The tables add up: B2B + B2C − credit notes = HSN summary = the month's total.
 
-**Records (Rules 56–57).** Bills, purchases, payments and returns are never edited or deleted; corrections are new entries. Edits to products and settings, and voided numbers, go into a **change log** (Settings → Change log). The server writes a **backup every day** to `data/backups/` and keeps 60 days (`HISAAB_BACKUP_DIR`, `HISAAB_BACKUP_KEEP`). Settings → *Download backup* gives you a copy to keep off the machine. Records are kept indefinitely; the law asks for at least 72 months.
+**Records (Rules 56–57).** Bills, purchases, payments and returns are never edited or deleted; corrections are new entries. Edits to products and settings, and voided numbers, go into a **change log** (Settings → Change log). A **backup is made every day**, encrypted and copied off-site (see *Backups* below). Records are kept indefinitely; the law asks for at least 72 months.
 
 **Not covered — use your CA or other software for these:**
 - e-invoicing (IRN/QR; only above ₹5 crore turnover)
@@ -83,6 +83,34 @@ The tables add up: B2B + B2C − credit notes = HSN summary = the month's total.
 - uploading to the GST portal (use the offline tool with these CSVs)
 
 Have your CA review an invoice and a month's GSTR-1 files before you rely on them.
+
+## Backups
+
+Every day the server makes a backup in `data/backups/`, keeping the newest 60 (`HISAAB_BACKUP_DIR`, `HISAAB_BACKUP_KEEP`). Set it up under **Settings → Backups** (owner):
+
+1. **Passphrase:** 12 or more characters; a short sentence works well. Backups are compressed and then encrypted with AES-256-GCM, using a key derived from the passphrase with scrypt (a fresh salt and IV for every file). Tampering with any byte makes the file refuse to open rather than give wrong data. **Write the passphrase down:** without it nobody can open the backups. Changing it only affects new backups. You can also set it on the server with `HISAAB_BACKUP_PASSPHRASE`.
+2. **Off-site copy:** each day's encrypted backup is also sent to one of:
+   - **Cloud storage that speaks S3:** Cloudflare R2, Backblaze B2, Wasabi, AWS S3 (Mumbai is `ap-south-1`), DigitalOcean Spaces. Create a bucket and an access key that can only write to it. Hisaab never deletes anything there; set a lifecycle rule on the bucket (e.g. delete after 400 days) if you want old copies removed.
+   - **Nextcloud / WebDAV:** use an app password.
+   - **A folder** on the computer running Hisaab that Google Drive, Dropbox or OneDrive syncs, or a USB drive.
+
+   Only encrypted backups ever leave the computer. Without a passphrase, nothing is sent.
+
+- **What's left out of every backup:** the passphrase, the storage credentials and all sign-in sessions. A backup never carries its own keys or a way to sign in. Logins are kept, so after a restore everyone just signs in again.
+- **Buttons:**
+  - *Back up now*
+  - *Test restore* (opens the newest backup and checks the database inside)
+  - *Download* (encrypted once a passphrase is set)
+- **Warnings:** Settings warns the owner when backups aren't encrypted, aren't copied off-site, the last copy failed, or there's been no off-site copy for two days.
+
+**Restoring:**
+
+```bash
+npm run restore -- data/backups/hisaab-2026-10-26T12-13-15-870.db.enc restored.db   # asks for the passphrase
+# stop Hisaab, move data/hisaab.db aside, put restored.db in its place, start Hisaab
+```
+
+The restore checks the passphrase and the database's integrity before writing anything, and never overwrites an existing file. Re-enter the off-site settings afterwards.
 
 ## Run it
 
@@ -169,7 +197,9 @@ Once logins are set up, every endpoint except `health`, `auth/status`, `auth/log
 | `POST /api/documents/void` | `{number, reason?}` | Report a device-allocated number that will never be issued |
 | `GET /api/reports/gstr1` | `?month=2026-10`, `&section=b2b\|b2cl\|b2cs\|cdnr\|cdnur\|hsn_b2b\|hsn_b2c\|docs&format=csv` | GSTR-1 tables for the month (shop's local time) |
 | `GET /api/audit-log` | `?entity=&limit=` | Log of edits (Rule 56(8)) |
-| `GET /api/backup` | | Download a consistent copy of the database |
+| `GET /api/backup` | | Download a backup (encrypted once a passphrase is set) |
+| `GET /api/backup/config`, `PUT /api/backup/config` | `{passphrase?, destination?: null \| {type: s3\|webdav\|folder, …}}` | Owner: backup settings. Secrets are write-only (the response only says whether they're set) |
+| `POST /api/backup/run`, `POST /api/backup/verify` | | Back up now; open the newest backup and check it |
 | `GET /api/reports/profit` | `?from=&to=` (UTC, default this month), `&tz=330` (minutes from UTC, for local days), `&format=csv` (`&by=day` for daily rows) | Summary (gross sales, returns, net sales, cost of goods, gross profit, margin, GST, products without cost), `by_day`, `by_product` |
 | `GET /api/summary` | `?since=YYYY-MM-DD HH:MM:SS` (UTC) | Dashboard numbers |
 
@@ -180,6 +210,8 @@ server/db.js      schema, migrations (incl. table rebuilds) + data access (SQLit
 server/app.js     JSON API + static hosting
 server/index.js   entry point (HTTP/HTTPS, daily backups)
 server/context.js who is making the current request
+server/backup.js  encrypted backups, S3 / WebDAV / folder upload
+scripts/restore.js  decrypt and check a backup
 public/           mobile web app (no build step)
   gst.js          GST rules shared by server and app: GSTIN check, states, rates, tax split, numbering, FY
   invoice.js      printable tax invoice and credit note
@@ -190,10 +222,9 @@ test/             API tests (node:test)
 
 ## Possible next steps
 
-- Multi-user logins and roles (owner vs. cashier), multiple shops
-- Encrypted off-site backups
+- Several shops under one owner
 - Purchase-side GST (supplier invoice details for ITC and GSTR-2B matching); GSTR-3B worksheet
 - Reorder suggestions from sales speed and low stock; slow-moving / dead stock report
-- Full GST invoices (GSTIN, HSN codes, CGST/SGST split), thermal printer support
+- Thermal receipt printer support
 - Product lookup from a public barcode catalog; SMS reminders for udhaar
 - Native app wrapper (Capacitor) if Play Store distribution is needed

@@ -2,31 +2,30 @@
 // camera access on https:// (or on localhost).
 import { createServer as createHttp } from 'node:http';
 import { createServer as createHttps } from 'node:https';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { networkInterfaces } from 'node:os';
-import { join } from 'node:path';
 import { openDb } from './db.js';
 import { createHandler } from './app.js';
+import { runBackup } from './backup.js';
 
 const port = Number(process.env.PORT ?? 3000);
 const store = openDb(process.env.HISAAB_DB ?? 'data/hisaab.db');
-const handler = createHandler(store, { pin: process.env.HISAAB_PIN || undefined });
 
-// Rule 57: keep restorable backups. One copy per day in HISAAB_BACKUP_DIR (default data/backups),
-// keeping the newest HISAAB_BACKUP_KEEP (default 60). Copy that folder off the machine regularly.
+// Rule 57: keep restorable backups. Once a day a backup goes to HISAAB_BACKUP_DIR (default
+// data/backups), encrypted when a backup passphrase is set, and is copied off-site when a
+// destination is set (Settings → Backups). The newest HISAAB_BACKUP_KEEP (default 60) are kept here.
 const backupDir = process.env.HISAAB_BACKUP_DIR ?? 'data/backups';
-const keep = Number(process.env.HISAAB_BACKUP_KEEP ?? 60);
-const BACKUP_FILE = /^hisaab-\d{4}-\d{2}-\d{2}\.db$/;
-function dailyBackup() {
+const backupKeep = Number(process.env.HISAAB_BACKUP_KEEP ?? 60);
+const handler = createHandler(store, { pin: process.env.HISAAB_PIN || undefined, backupDir, backupKeep });
+
+async function dailyBackup() {
+  const last = store.getBackupStatus().local?.at?.slice(0, 10);
+  if (last === new Date().toISOString().slice(0, 10)) return;
   try {
-    mkdirSync(backupDir, { recursive: true });
-    const file = join(backupDir, `hisaab-${new Date().toISOString().slice(0, 10)}.db`);
-    if (!existsSync(file)) {
-      store.backupTo(file);
-      console.log(`Backup written: ${file}`);
-    }
-    for (const old of readdirSync(backupDir).filter((f) => BACKUP_FILE.test(f)).sort().slice(0, -keep)) {
-      rmSync(join(backupDir, old));
+    const status = await runBackup(store, { dir: backupDir, keep: backupKeep });
+    console.log(`Backup written: ${status.local.file}${status.local.encrypted ? ' (encrypted)' : ''}`);
+    if (status.offsite?.at === status.local.at) {
+      console.log(status.offsite.ok ? `  copied off-site: ${status.offsite.where}` : `  OFF-SITE COPY FAILED: ${status.offsite.error}`);
     }
   } catch (err) {
     console.error('Backup failed:', err.message);
@@ -34,7 +33,7 @@ function dailyBackup() {
 }
 if (process.env.HISAAB_DB !== ':memory:') {
   dailyBackup();
-  setInterval(dailyBackup, 60 * 60 * 1000).unref(); // checks hourly, writes once a day
+  setInterval(dailyBackup, 60 * 60 * 1000).unref(); // checks hourly, runs once a day
 }
 
 const tls = process.env.HTTPS_KEY && process.env.HTTPS_CERT;

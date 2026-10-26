@@ -9,6 +9,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { HttpError, GST_RATES, UQC, hsnValid } from './db.js';
 import { gstDate } from '../public/gst.js';
 import { currentUser, requestContext } from './context.js';
+import { DESTINATIONS, MIN_PASSPHRASE, backupPassphrase, encryptFile, latestBackup, runBackup, verifyBackup } from './backup.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const MIME = {
@@ -170,6 +171,42 @@ const STREAMED = Symbol('streamed'); // the route already wrote the response
 
 const isCashier = () => currentUser()?.role === 'cashier';
 
+// What the owner sees of the backup settings.
+function backupView(store) {
+  const config = store.getBackupConfig();
+  const d = config.destination;
+  const masked = d && Object.fromEntries(Object.entries(d).map(([k, v]) =>
+    DESTINATIONS[d.type].secrets.includes(k) ? [`${k}_set`, Boolean(v)] : [k, v]));
+  return {
+    passphrase_set: Boolean(backupPassphrase(config)),
+    passphrase_from_server: Boolean(process.env.HISAAB_BACKUP_PASSPHRASE),
+    destination: masked ?? null,
+    status: store.getBackupStatus(),
+  };
+}
+
+function destinationFields(body, previous) {
+  if (body === null) return null;
+  const type = body?.type;
+  const spec = DESTINATIONS[type];
+  if (!spec) throw new HttpError(400, `destination.type must be one of ${Object.keys(DESTINATIONS).join(', ')}`);
+  const same = previous?.type === type ? previous : {};
+  const out = { type };
+  const fields = { s3: ['endpoint', 'region', 'bucket', 'prefix', 'access_key', 'secret_key'], webdav: ['url', 'username', 'password'], folder: ['path'] }[type];
+  for (const f of fields) {
+    const v = body[f] === '' && spec.secrets.includes(f) ? undefined : str(body[f], `destination.${f}`, { max: 500 });
+    out[f] = v ?? (spec.secrets.includes(f) ? same[f] : undefined);
+  }
+  if (body.path_style !== undefined) out.path_style = bool(body.path_style, 'destination.path_style');
+  for (const f of spec.required) if (!out[f]) throw new HttpError(400, `destination.${f} is required`);
+  for (const f of ['endpoint', 'url']) {
+    if (out[f] && !/^https:\/\//.test(out[f]) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(out[f])) {
+      throw new HttpError(400, `destination.${f} must start with https://`);
+    }
+  }
+  return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined));
+}
+
 const bearer = (req) => /^Bearer (\S+)$/.exec(req.headers.authorization ?? '')?.[1] ?? null;
 
 // PINs are 4–12 digits; owners need at least 6, as an owner login can see and change everything.
@@ -296,7 +333,7 @@ async function serveStatic(req, res, pathname) {
 
 // --- routes -------------------------------------------------------------
 
-function routes(store) {
+function routes(store, { backupDir, backupKeep }) {
   // A bill with what can still be returned from it. Cashiers open their own bills — or any bill,
   // to take a return, when the owner allows cashier returns.
   const saleDetail = (sale) => {
@@ -716,20 +753,66 @@ function routes(store) {
     ['GET', /^\/api\/audit-log$/, (_req, _m, url) =>
       store.listAudit({ entity: url.searchParams.get('entity') ?? undefined, limit: Math.min(Number(url.searchParams.get('limit')) || 100, 1000) })],
 
-    // A full copy of the database, for safe keeping (Rule 57).
+    // A full copy of the database to download (Rule 57) — encrypted when a backup passphrase is set.
     ['GET', /^\/api\/backup$/, async (_req, _m, _url, res) => {
       const dir = await mkdtemp(join(tmpdir(), 'hisaab-backup-'));
-      const file = join(dir, 'hisaab.db');
-      store.backupTo(file);
-      const name = `hisaab-backup-${new Date().toISOString().slice(0, 10)}.db`;
-      res.writeHead(200, {
-        'content-type': 'application/vnd.sqlite3',
-        'content-disposition': `attachment; filename="${name}"`,
-        'cache-control': 'no-store',
-      });
-      await new Promise((resolve, reject) => createReadStream(file).on('error', reject).on('end', resolve).pipe(res));
-      await rm(dir, { recursive: true, force: true });
+      try {
+        const plain = join(dir, 'hisaab.db');
+        store.backupTo(plain);
+        const passphrase = backupPassphrase(store.getBackupConfig());
+        let file = plain;
+        if (passphrase) await encryptFile(plain, (file = plain + '.enc'), passphrase);
+        const name = `hisaab-backup-${new Date().toISOString().slice(0, 10)}.db${passphrase ? '.enc' : ''}`;
+        res.writeHead(200, {
+          'content-type': passphrase ? 'application/octet-stream' : 'application/vnd.sqlite3',
+          'content-disposition': `attachment; filename="${name}"`,
+          'cache-control': 'no-store',
+        });
+        await new Promise((resolve, reject) => createReadStream(file).on('error', reject).on('end', resolve).pipe(res));
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
       return STREAMED;
+    }],
+
+    // Backup settings as the owner sees them: secrets are never sent back, only whether they're set.
+    ['GET', /^\/api\/backup\/config$/, () => backupView(store)],
+
+    // { passphrase?, destination?: null | { type: s3|webdav|folder, ...fields } }
+    // Leave a secret field out (or empty) to keep the one already saved.
+    ['PUT', /^\/api\/backup\/config$/, async (req) => {
+      const body = await readJson(req);
+      const config = { ...store.getBackupConfig() };
+      const changes = {};
+      if (body.passphrase !== undefined && body.passphrase !== '') {
+        if (process.env.HISAAB_BACKUP_PASSPHRASE) throw new HttpError(409, 'The passphrase is set on the server (HISAAB_BACKUP_PASSPHRASE)');
+        const pass = str(body.passphrase, 'passphrase', { max: 200 });
+        if (!pass || pass.length < MIN_PASSPHRASE) throw new HttpError(400, `Use a passphrase of at least ${MIN_PASSPHRASE} characters — a short sentence is easy to remember`);
+        config.passphrase = pass;
+        changes.passphrase = 'changed';
+      }
+      if (body.destination !== undefined) {
+        config.destination = destinationFields(body.destination, config.destination);
+        changes.destination = config.destination ? { type: config.destination.type } : null;
+      }
+      store.setBackupConfig(config, changes);
+      return backupView(store);
+    }],
+
+    ['POST', /^\/api\/backup\/run$/, async () => {
+      await runBackup(store, { dir: backupDir, keep: backupKeep });
+      return backupView(store);
+    }],
+
+    // Proves the newest backup opens: decrypts it and checks the database inside.
+    ['POST', /^\/api\/backup\/verify$/, async () => {
+      const file = await latestBackup(backupDir);
+      if (!file) throw new HttpError(404, 'No backup yet — press Back up now first');
+      try {
+        return await verifyBackup(file, backupPassphrase(store.getBackupConfig()));
+      } catch (err) {
+        throw new HttpError(422, `${file.split(/[\\/]/).pop()}: ${err.message}`);
+      }
     }],
 
     // Gross profit for a period: ?from=&to= (UTC, default this month), &tz=330 (minutes east of UTC,
@@ -804,8 +887,8 @@ function routes(store) {
   ];
 }
 
-export function createHandler(store, { pin } = {}) {
-  const table = routes(store);
+export function createHandler(store, { pin, backupDir = 'data/backups', backupKeep = 60 } = {}) {
+  const table = routes(store, { backupDir, backupKeep });
 
   return async function handler(req, res) {
     const url = new URL(req.url, 'http://localhost');

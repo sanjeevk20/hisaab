@@ -756,8 +756,47 @@ class Store {
   }
 
   // Rule 57: keep a restorable backup. Writes a consistent copy of the whole database to `path`.
+  // The copy leaves out the backup passphrase and storage credentials and all sign-in sessions,
+  // so a backup never carries the keys to itself or a way to sign in.
   backupTo(path) {
     this.db.prepare('VACUUM INTO ?').run(path);
+    const copy = new DatabaseSync(path);
+    try {
+      copy.exec("DELETE FROM settings WHERE key IN ('backup', 'backup_status'); DELETE FROM sessions; VACUUM;");
+    } finally {
+      copy.close();
+    }
+  }
+
+  #setting(key) {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    return row ? JSON.parse(row.value) : null;
+  }
+
+  #saveSetting(key, value) {
+    this.db
+      .prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, JSON.stringify(value));
+  }
+
+  // Backup passphrase and off-site destination, including secrets. Owner-only; never sent out as is.
+  getBackupConfig() {
+    return this.#setting('backup') ?? { passphrase: null, destination: null };
+  }
+
+  setBackupConfig(config, changes) {
+    this.transaction(() => {
+      this.#saveSetting('backup', config);
+      this.audit('backup', null, 'update', changes);
+    });
+  }
+
+  getBackupStatus() {
+    return this.#setting('backup_status') ?? {};
+  }
+
+  saveBackupStatus(status) {
+    this.#saveSetting('backup_status', status);
   }
 
   // --- products ---------------------------------------------------------
