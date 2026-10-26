@@ -50,6 +50,19 @@ function int(v, field, { required = false, min = 0, max = 1e12 } = {}) {
   return v;
 }
 
+// A quantity: more than 0 (or 0 when allowZero), at most 3 decimals. Whether decimals are allowed
+// for a product depends on its unit (KGS, LTR, MTR) and is checked when it's used.
+function qty(v, field, { required = false, allowZero = false, allowNegative = false } = {}) {
+  if (v === undefined || v === null || v === '') {
+    if (required) throw new HttpError(400, `${field} is required`);
+    return undefined;
+  }
+  const ok = typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= 1e6 && Math.round(v * 1000) / 1000 === v
+    && (v > 0 || (allowZero && v === 0) || (allowNegative && v < 0));
+  if (!ok) throw new HttpError(400, `${field} must be a number${allowNegative ? '' : allowZero ? ' of 0 or more' : ' more than 0'} with at most 3 decimals`);
+  return v;
+}
+
 function rate(v) {
   if (v === undefined || v === null) return undefined;
   if (!GST_RATES.includes(v)) throw new HttpError(400, `gst_rate must be one of ${GST_RATES.join(', ')}`);
@@ -279,11 +292,11 @@ function productFields(body, { partial }) {
     price: int(body.price, 'price', { required: !partial }),
     cost: int(body.cost, 'cost'),
     gst_rate: rate(body.gst_rate),
-    low_stock: int(body.low_stock, 'low_stock', { max: 1e6 }),
+    low_stock: qty(body.low_stock, 'low_stock', { allowZero: true }),
     hsn: body.hsn === '' && partial ? null : hsn(body.hsn),
     unit: unit(body.unit),
   };
-  if (!partial) fields.quantity = int(body.quantity, 'quantity', { max: 1e6 }) ?? 0;
+  if (!partial) fields.quantity = qty(body.quantity, 'quantity', { allowZero: true }) ?? 0;
   return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
 }
 
@@ -430,7 +443,7 @@ function routes(store, { backupDir, backupKeep }) {
     // Manual stock change: { change: +10 | -2, reason: 'stock_in' | 'adjustment', note }
     ['POST', /^\/api\/products\/(\d+)\/stock$/, async (req, m) => {
       const body = await readJson(req);
-      const change = int(body.change, 'change', { required: true, min: -1e6, max: 1e6 });
+      const change = qty(body.change, 'change', { required: true, allowNegative: true });
       if (change === 0) throw new HttpError(400, 'change cannot be 0');
       const reason = body.reason ?? (change > 0 ? 'stock_in' : 'adjustment');
       if (!['stock_in', 'adjustment'].includes(reason)) throw new HttpError(400, 'reason must be stock_in or adjustment');
@@ -445,7 +458,7 @@ function routes(store, { backupDir, backupKeep }) {
     ['POST', /^\/api\/stock-in$/, async (req) => {
       const body = await readJson(req);
       const barcode = str(body.barcode, 'barcode', { required: true, max: 64 });
-      const quantity = int(body.quantity, 'quantity', { required: true, min: 1, max: 1e6 });
+      const quantity = qty(body.quantity, 'quantity', { required: true });
       const clientId = str(body.client_id, 'client_id', { max: 64 }) ?? null;
       return store.transaction(() => {
         const seen = clientId && store.productForMovement(clientId);
@@ -548,7 +561,7 @@ function routes(store, { backupDir, backupKeep }) {
       if (body.items.length > 500) throw new HttpError(400, 'Too many items');
       const items = body.items.map((it, i) => ({
         barcode: str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 }),
-        quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }),
+        quantity: qty(it?.quantity, `items[${i}].quantity`, { required: true }),
         unit_cost: int(it?.unit_cost, `items[${i}].unit_cost`),
       }));
       const settlement = body.settlement ?? 'adjust';
@@ -603,12 +616,12 @@ function routes(store, { backupDir, backupKeep }) {
       if (body.items.length > 500) throw new HttpError(400, 'Too many items');
       const items = body.items.map((it, i) => ({
         barcode: str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 }),
-        quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }),
+        quantity: qty(it?.quantity, `items[${i}].quantity`, { required: true }),
         unit_cost: int(it?.unit_cost, `items[${i}].unit_cost`, { required: true }),
         name: str(it?.name, `items[${i}].name`),
         price: int(it?.price, `items[${i}].price`),
         gst_rate: rate(it?.gst_rate),
-        low_stock: int(it?.low_stock, `items[${i}].low_stock`, { max: 1e6 }),
+        low_stock: qty(it?.low_stock, `items[${i}].low_stock`, { allowZero: true }),
         hsn: hsn(it?.hsn, `items[${i}].hsn`),
         unit: unit(it?.unit, `items[${i}].unit`),
       }));
@@ -672,7 +685,7 @@ function routes(store, { backupDir, backupKeep }) {
       if (body.items.length > 500) throw new HttpError(400, 'Too many items');
       const items = body.items.map((it, i) => ({
         barcode: str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 }),
-        quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }),
+        quantity: qty(it?.quantity, `items[${i}].quantity`, { required: true }),
       }));
       const refund_method = body.refund_method ?? 'cash';
       if (!['cash', 'upi', 'card', 'khata'].includes(refund_method)) {
@@ -851,7 +864,7 @@ function routes(store, { backupDir, backupKeep }) {
       const items = body.items.map((it, i) => {
         const product_id = int(it?.product_id, `items[${i}].product_id`, { min: 1 });
         const barcode = product_id ? undefined : str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 });
-        const item = { product_id, barcode, quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }) };
+        const item = { product_id, barcode, quantity: qty(it?.quantity, `items[${i}].quantity`, { required: true }) };
         // An offline sale sends each line as printed on the customer's invoice.
         if (body.offline === true && it?.unit_price !== undefined) {
           Object.assign(item, {

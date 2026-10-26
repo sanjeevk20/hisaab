@@ -120,18 +120,19 @@ async function seed() {
     ['8901499008667', 'Fortune Sunflower Oil 1L', 16500, 14200, 5, '1512', 'BTL'],
     ['8901396393209', 'Dettol Soap 75g', 4000, 3100, 18, '3401', 'NOS'],
     ['8904109450303', 'Aashirvaad Atta 5kg', 28500, 25000, 5, '1101', 'BAG'],
+    ['SUGAR', 'Sugar (loose)', 4800, 4200, 5, '1701', 'KGS'],
   ];
   await call('/purchases', 'POST', {
     supplier_name: 'Gupta Wholesale', supplier_phone: '9811100000', invoice_no: 'GW-2291', paid: 500000, payment_method: 'upi',
     items: products.map(([barcode, name, price, cost, gst_rate, hsn, unit]) => ({
-      barcode, name, price, unit_cost: cost, gst_rate, hsn, unit, quantity: barcode.endsWith('278') ? 6 : 30,
+      barcode, name, price, unit_cost: cost, gst_rate, hsn, unit, quantity: barcode.endsWith('278') ? 6 : unit === 'KGS' ? 25.5 : 30,
     })),
     created_at: daysAgo(6, 9),
   });
   const baskets = [
     [6, [[0, 2], [1, 1], [3, 4]], 'cash'], [5, [[2, 1], [6, 2]], 'upi'], [5, [[7, 1], [5, 1]], 'cash'],
     [4, [[3, 6], [4, 1]], 'upi'], [3, [[1, 2], [0, 3], [6, 1]], 'cash'], [2, [[5, 2], [7, 1]], 'card'],
-    [1, [[2, 1], [3, 2]], 'upi'], [0, [[0, 2], [4, 1]], 'cash'],
+    [1, [[2, 1], [3, 2], [8, 1.5]], 'upi'], [0, [[0, 2], [4, 1], [8, 0.75]], 'cash'],
   ];
   const bills = [];
   for (const [d, items, payment_method] of baskets) {

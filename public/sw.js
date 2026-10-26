@@ -1,7 +1,7 @@
 // Service worker: keeps the app shell (and the iPhone barcode library) available offline.
 // App files are network-first so updates show up as soon as the shop is online; the API is
 // never cached here — offline data lives in IndexedDB (see offline.js).
-const CACHE = 'hisaab-v9';
+const CACHE = 'hisaab-v10';
 // Relative to this file, so the app also works under a sub-path (e.g. GitHub Pages /hisaab/).
 const SHELL = ['./', 'app.js', 'scanner.js', 'offline.js', 'gst.js', 'invoice.js', 'styles.css', 'manifest.webmanifest', 'icon.svg'];
 const ZXING = 'https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js';
