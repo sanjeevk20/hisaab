@@ -23,6 +23,21 @@ export const UQC = {
   TBS: 'TABLETS', CAN: 'CANS', OTH: 'OTHERS',
 };
 
+// Loose goods sold by weight, volume or length: quantities may have up to 3 decimals
+// (0.75 kg, 1.250 L). Everything else is counted in whole units.
+export const LOOSE_UNITS = ['KGS', 'LTR', 'MTR'];
+export const isLoose = (unit) => LOOSE_UNITS.includes(unit);
+// Quantities are kept to 3 decimals so repeated sales never drift (no 9.700000000001 kg).
+export const round3 = (n) => Math.round(n * 1000) / 1000;
+// Amount for a quantity at a unit price, to the paisa: 0.75 kg × ₹48 = ₹36.00.
+export const lineAmount = (unitPrice, quantity) => Math.round(unitPrice * quantity);
+
+export function quantityProblem(name, unit, quantity) {
+  if (!(quantity > 0)) return `${name}: quantity must be more than 0`;
+  if (isLoose(unit)) return round3(quantity) === quantity ? null : `${name}: use at most 3 decimals (e.g. 0.250)`;
+  return Number.isInteger(quantity) ? null : `${name} is counted in whole ${unit ?? 'NOS'} — set its unit to KGS, LTR or MTR to sell it loose`;
+}
+
 const GSTIN_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
 // Format plus the check digit in the 15th place.

@@ -5,6 +5,12 @@ A phone-first web app for kirana / small retail shops:
 - **Stock in** — point the phone camera at a product barcode. A known product gets its quantity increased; a new barcode asks for name, price and GST once, then it's a one-scan restock forever.
 - **Bill** — scan items into a cart, apply a discount, pick Cash / UPI / Card / Udhaar, complete the sale. Sold quantities are **removed from stock automatically** in the same database transaction as the bill. If any item is short, nothing is written.
 - **Receipt** — print it, or send it to the customer on WhatsApp.
+- **Loose goods by weight** — give a product the unit **KGS**, **LTR** or **MTR** and it's sold by weight, volume or length, to 3 decimals (0.75 kg, 1.250 L):
+  - The price is per kg, litre or metre, and each line is rounded to the paisa (0.75 kg × ₹48 = ₹36.00).
+  - Scanning it on the Bill tab, or typing its code, adds a weight box ready to type into.
+  - Stock-in, purchases, returns and stock corrections take decimals too, and stock shows as "9.75 kg".
+  - Packets and pieces (NOS, PAC, …) stay whole numbers.
+  - Stock is kept to 3 decimals, so many small sales never drift.
 - **Customer returns** — on *Bill*, switch to *Customer return*. Load the bill (type its number, or tap *↩ Return* on any receipt) and the refund is exactly what the customer paid, after their share of any bill discount. You can't return more than was bought. No bill? Just scan the items; they're refunded at today's price. Refund in Cash / UPI / Card or *Off udhaar*; an udhaar bill defaults to coming off the khata. Untick *Put back in stock* for damaged goods.
 - **Inventory** — search, low-stock filter, edit prices, correct stock (damage, recount), and see a full history of every stock movement.
 - **Supplier purchases** — when a delivery arrives, pick the supplier on *Stock in* and scan each item on their bill with its cost price. Saving the purchase adds everything to stock, updates cost prices, and records the invoice number and how much you paid now (cash / UPI / bank / cheque). The unpaid part goes on that supplier's account. The bill in progress is saved on the phone, so closing the app won't lose it.

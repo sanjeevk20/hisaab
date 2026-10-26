@@ -4,8 +4,8 @@ import {
   enqueue, getOutbox, onOutboxChange, sync, discard, retry, clearPrivateCache,
 } from './offline.js';
 import {
-  GST_RATES, STATES, UQC, creditNoteNumber, financialYear, gstinValid, invoiceNumber, invoiceProblem, localDate, splitTax,
-  stateLabel, taxOf,
+  GST_RATES, STATES, UQC, creditNoteNumber, financialYear, gstinValid, invoiceNumber, invoiceProblem, isLoose, lineAmount,
+  localDate, quantityProblem, round3, splitTax, stateLabel, taxOf,
 } from './gst.js';
 import { esc, rupees, taxInvoiceHtml, creditNoteHtml } from './invoice.js';
 
@@ -13,6 +13,11 @@ import { esc, rupees, taxInvoiceHtml, creditNoteHtml } from './invoice.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const toPaise = (v) => Math.round((parseFloat(v) || 0) * 100);
+// Loose goods (KGS, LTR, MTR) show their unit: "9.75 kg", "₹48.00/kg".
+const UNIT_SHORT = { KGS: 'kg', LTR: 'L', MTR: 'm' };
+const fmtQty = (q, unit) => (isLoose(unit) ? `${q} ${UNIT_SHORT[unit]}` : String(q));
+const perUnit = (unit) => (isLoose(unit) ? `/${UNIT_SHORT[unit]}` : '');
+const readQty = (v) => round3(parseFloat(v) || 0);
 // SQLite stores UTC 'YYYY-MM-DD HH:MM:SS'; show it in local time.
 const localTime = (s) => new Date(s.replace(' ', 'T') + 'Z').toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
 const digits = (s) => String(s ?? '').replace(/\D/g, '').replace(/^91(\d{10})$/, '$1');
@@ -258,8 +263,8 @@ async function findProduct(barcode) {
 
 function stockBadge(p) {
   if (p.quantity === 0) return '<span class="badge out">Out of stock</span>';
-  if (p.quantity <= p.low_stock) return `<span class="badge low">${p.quantity} left</span>`;
-  return `<span class="badge">${p.quantity} in stock</span>`;
+  if (p.quantity <= p.low_stock) return `<span class="badge low">${fmtQty(p.quantity, p.unit)} left</span>`;
+  return `<span class="badge">${fmtQty(p.quantity, p.unit)} in stock</span>`;
 }
 
 const modal = $('#modal');
@@ -399,6 +404,17 @@ async function addToCart(barcode) {
   }
   if (!p) return toast(`Barcode ${barcode} not in inventory — add it in Stock in`, true);
   const line = cart.get(p.barcode) ?? { product: p, quantity: 0 };
+  if (isLoose(p.unit)) {
+    // Sold by weight: start at 1 (or what's left) and let the cashier type the weight.
+    line.product = p;
+    if (!line.quantity) line.quantity = p.quantity > 0 && p.quantity < 1 ? p.quantity : 1;
+    cart.set(p.barcode, line);
+    renderCart();
+    const input = $(`#cart input[data-weight="${CSS.escape(p.barcode)}"]`);
+    input?.focus();
+    input?.select();
+    return toast(`${p.name}: type the weight in ${UNIT_SHORT[p.unit]}`);
+  }
   if (line.quantity + 1 > p.quantity) {
     // Online stock is authoritative. Offline, the saved count may be out of date, so warn only.
     if (!p.cached) return toast(p.quantity ? `Only ${p.quantity} of ${p.name} in stock` : `${p.name} is out of stock`, true);
@@ -413,9 +429,18 @@ async function addToCart(barcode) {
 
 function cartTotals() {
   let subtotal = 0;
-  for (const { product, quantity } of cart.values()) subtotal += product.price * quantity;
+  for (const { product, quantity } of cart.values()) subtotal += lineAmount(product.price, quantity);
   const discount = Math.min(toPaise($('#discount').value), subtotal);
   return { subtotal, discount, total: subtotal - discount };
+}
+
+const lineText = (price, quantity, unit) =>
+  `${rupees(price)}${perUnit(unit)} × ${fmtQty(quantity, unit)} = <strong>${rupees(lineAmount(price, quantity))}</strong>`;
+
+function renderCartTotals() {
+  const { subtotal, total } = cartTotals();
+  $('#subtotal').textContent = rupees(subtotal);
+  $('#total').textContent = rupees(total);
 }
 
 function renderCart() {
@@ -424,20 +449,24 @@ function renderCart() {
     <li>
       <div class="grow">
         <div class="title">${esc(p.name)}</div>
-        <div class="sub">${rupees(p.price)} × ${quantity} = <strong>${rupees(p.price * quantity)}</strong></div>
+        <div class="sub" data-line="${esc(p.barcode)}">${lineText(p.price, quantity, p.unit)}</div>
       </div>
+      ${isLoose(p.unit) ? `
+      <div class="qty weight">
+        <input type="number" inputmode="decimal" step="0.001" min="0.001" value="${quantity}" data-weight="${esc(p.barcode)}" aria-label="Weight">
+        <span>${UNIT_SHORT[p.unit]}</span>
+        <button class="btn" data-dec="${esc(p.barcode)}" data-all aria-label="Remove">×</button>
+      </div>` : `
       <div class="qty">
         <button class="btn" data-dec="${esc(p.barcode)}" aria-label="Less">−</button>
         <span>${quantity}</span>
         <button class="btn" data-inc="${esc(p.barcode)}" aria-label="More">+</button>
-      </div>
+      </div>`}
     </li>`).join('');
   const has = cart.size > 0;
   $('#cart-empty').classList.toggle('hidden', has);
   $('#checkout').classList.toggle('hidden', !has);
-  const { subtotal, total } = cartTotals();
-  $('#subtotal').textContent = rupees(subtotal);
-  $('#total').textContent = rupees(total);
+  renderCartTotals();
   const credit = $('input[name=pay]:checked').value === 'credit';
   $('#cust-name').placeholder = credit ? 'Customer name (required for udhaar)' : 'Customer name (optional)';
 }
@@ -451,11 +480,26 @@ $('#cart').onclick = (e) => {
       return toast(`Only ${line.product.quantity} in stock`, true);
     }
     line.quantity++;
-  } else if (--line.quantity <= 0) {
+  } else if (e.target.dataset.all !== undefined || --line.quantity <= 0) {
     cart.delete(line.product.barcode);
   }
   renderCart();
 };
+// Typing a weight updates that line and the totals as you type (without redrawing the list).
+$('#cart').oninput = (e) => {
+  const line = cart.get(e.target.dataset.weight);
+  if (!line) return;
+  line.quantity = readQty(e.target.value);
+  $(`#cart [data-line="${CSS.escape(line.product.barcode)}"]`).innerHTML = lineText(line.product.price, line.quantity, line.product.unit);
+  renderCartTotals();
+};
+$('#cart').addEventListener('change', (e) => {
+  const line = cart.get(e.target.dataset.weight);
+  if (!line) return;
+  if (line.quantity > line.product.quantity && !line.product.cached) {
+    toast(`Only ${fmtQty(line.product.quantity, line.product.unit)} of ${line.product.name} in stock`, true);
+  }
+});
 $('#discount').oninput = renderCart;
 $('.pay-methods').onchange = renderCart;
 $('#clear-cart').onclick = () => {
@@ -512,6 +556,11 @@ $('#do-checkout').onclick = async (e) => {
     return toast('Enter the customer name for udhaar', true);
   }
   const lines = [...cart.values()];
+  for (const { product: p, quantity } of lines) {
+    const problem = quantityProblem(p.name, p.unit, quantity);
+    if (problem) return toast(problem, true);
+    if (quantity > p.quantity && !p.cached) return toast(`Only ${fmtQty(p.quantity, p.unit)} of ${p.name} in stock`, true);
+  }
   const { discount, total } = cartTotals();
   const buyer_gstin = gstOn() ? $('#buyer-gstin').value.trim().toUpperCase() || undefined : undefined;
   const buyer_address = gstOn() ? $('#buyer-address').value.trim() || undefined : undefined;
@@ -580,7 +629,7 @@ function invoicePreview({ lines, discount, payment_method, customer_name, custom
   const pos = place_of_supply ?? shop.state_code ?? null;
   const inter = Boolean(gstOn() && pos && pos !== shop.state_code);
   const items = lines.map(({ product: p, quantity }) => ({
-    barcode: p.barcode, name: p.name, quantity, unit_price: p.price, line_total: p.price * quantity,
+    barcode: p.barcode, name: p.name, quantity, unit_price: p.price, line_total: lineAmount(p.price, quantity),
     gst_rate: p.gst_rate, hsn: p.hsn ?? null, unit: p.unit ?? 'NOS',
   }));
   const split = splitTax(items.map((i) => ({ amount: i.line_total, rate: i.gst_rate })), discount, inter);
@@ -598,7 +647,7 @@ function invoicePreview({ lines, discount, payment_method, customer_name, custom
 }
 
 function receiptText(sale) {
-  const lines = sale.items.map((i) => `${i.name} x${i.quantity} = ${rupees(i.line_total)}`);
+  const lines = sale.items.map((i) => `${i.name} ${isLoose(i.unit) ? fmtQty(i.quantity, i.unit) : 'x' + i.quantity} = ${rupees(i.line_total)}`);
   return [
     `${shopName()} — ${gstOn() ? 'Tax invoice' : 'Bill'} ${sale.invoice_no ?? (sale.id ? '#' + sale.id : '')}`.trim(),
     localTime(sale.created_at),
@@ -648,7 +697,7 @@ function plainReceiptHtml(sale) {
       <div>${sale.invoice_no ? `Bill ${esc(sale.invoice_no)}` : sale.id ? `Bill #${sale.id}` : 'Bill (saved offline, syncs later)'} · ${localTime(sale.created_at)}</div>
       ${sale.customer_name ? `<div>Customer: ${esc(sale.customer_name)}</div>` : ''}
       <table>
-        ${sale.items.map((i) => `<tr><td>${esc(i.name)}<br><span class="muted">${i.quantity} × ${rupees(i.unit_price)}</span></td><td>${rupees(i.line_total)}</td></tr>`).join('')}
+        ${sale.items.map((i) => `<tr><td>${esc(i.name)}<br><span class="muted">${fmtQty(i.quantity, i.unit)} × ${rupees(i.unit_price)}${perUnit(i.unit)}</span></td><td>${rupees(i.line_total)}</td></tr>`).join('')}
         <tr class="sep"><td>Subtotal</td><td>${rupees(sale.subtotal)}</td></tr>
         ${sale.discount ? `<tr><td>Discount</td><td>−${rupees(sale.discount)}</td></tr>` : ''}
         <tr><td><strong>Total</strong></td><td><strong>${rupees(sale.total)}</strong></td></tr>
@@ -763,6 +812,10 @@ async function addToReturn(barcode) {
   if (ret.sale) {
     const line = ret.lines.get(barcode);
     if (!line) return toast(`That item is not on bill ${ret.sale.invoice_no ?? '#' + ret.sale.id}`, true);
+    if (isLoose(line.unit)) {
+      renderReturn();
+      return $(`#return-lines input[data-rweight="${CSS.escape(barcode)}"]`)?.focus();
+    }
     if (line.quantity >= line.max) return toast(`Only ${line.max} of ${line.name} can come back from this bill`, true);
     line.quantity++;
     toast(`${line.name} ×${line.quantity} to return`);
@@ -775,8 +828,8 @@ async function addToReturn(barcode) {
     return toast(err.message, true);
   }
   if (!p) return toast(`Barcode ${barcode} is not in your inventory`, true);
-  const line = ret.lines.get(p.barcode) ?? { barcode: p.barcode, name: p.name, quantity: 0, unit_price: p.price, max: null };
-  line.quantity++;
+  const line = ret.lines.get(p.barcode) ?? { barcode: p.barcode, name: p.name, quantity: 0, unit_price: p.price, max: null, unit: p.unit };
+  line.quantity = isLoose(p.unit) ? line.quantity || 1 : line.quantity + 1;
   ret.lines.set(p.barcode, line);
   toast(`${p.name} ×${line.quantity} to return`);
   renderReturn();
@@ -793,15 +846,20 @@ function renderReturn() {
     <li>
       <div class="grow">
         <div class="title">${esc(l.name)}</div>
-        <div class="sub">${rupees(l.unit_price)} each${l.max !== null ? ` · <span class="return-max">${l.max ? `up to ${l.max}` : 'all returned already'}</span>` : ''}</div>
+        <div class="sub">${rupees(l.unit_price)}${isLoose(l.unit) ? perUnit(l.unit) : ' each'}${l.max !== null ? ` · <span class="return-max">${l.max ? `up to ${fmtQty(l.max, l.unit)}` : 'all returned already'}</span>` : ''}</div>
       </div>
+      ${isLoose(l.unit) ? `
+      <div class="qty weight">
+        <input type="number" inputmode="decimal" step="0.001" min="0" ${l.max !== null ? `max="${l.max}"` : ''} value="${l.quantity}" data-rweight="${esc(l.barcode)}" aria-label="Weight">
+        <span>${UNIT_SHORT[l.unit]}</span>
+      </div>` : `
       <div class="qty">
         <button class="btn" data-rdec="${esc(l.barcode)}" aria-label="Less">−</button>
         <span>${l.quantity}</span>
         <button class="btn" data-rinc="${esc(l.barcode)}" aria-label="More">+</button>
-      </div>
+      </div>`}
     </li>`).join('');
-  const total = lines.reduce((t, l) => t + l.unit_price * l.quantity, 0);
+  const total = lines.reduce((t, l) => t + lineAmount(l.unit_price, l.quantity), 0);
   const any = lines.some((l) => l.quantity > 0);
   $('#return-empty').classList.toggle('hidden', lines.length > 0);
   $('#return-checkout').classList.toggle('hidden', !any);
@@ -823,6 +881,16 @@ $('#return-lines').onclick = (e) => {
   }
   renderReturn();
 };
+$('#return-lines').addEventListener('change', (e) => {
+  const line = ret.lines.get(e.target.dataset.rweight);
+  if (!line) return;
+  line.quantity = Math.max(0, readQty(e.target.value));
+  if (line.max !== null && line.quantity > line.max) {
+    line.quantity = line.max;
+    toast(`Only ${fmtQty(line.max, line.unit)} can come back from this bill`, true);
+  }
+  renderReturn();
+});
 $('#return-refund').onchange = renderReturn;
 $('#return-clear').onclick = () => confirm('Clear this return?') && resetReturn();
 
@@ -835,7 +903,7 @@ $('#return-save').onclick = async (e) => {
   const customer_name = needsCustomer ? $('#return-cust-name').value.trim() || undefined : undefined;
   const customer_phone = needsCustomer ? $('#return-cust-phone').value.trim() || undefined : undefined;
   if (needsCustomer && !customer_name && !customer_phone) return toast('Enter the customer whose udhaar this comes off', true);
-  const total = lines.reduce((t, l) => t + l.unit_price * l.quantity, 0);
+  const total = lines.reduce((t, l) => t + lineAmount(l.unit_price, l.quantity), 0);
   if (gstOn() && !ret.sale) return toast('Load the bill first — a credit note must refer to the original invoice', true);
   const limitProblem = cashierReturnProblem(total);
   if (limitProblem) return toast(limitProblem, true);
@@ -861,7 +929,7 @@ $('#return-save').onclick = async (e) => {
     const inter = Boolean(sale?.inter_state);
     const items = lines.map((l) => ({
       name: l.name, hsn: l.hsn, unit: l.unit, gst_rate: l.gst_rate ?? 0, quantity: l.quantity, unit_price: l.unit_price,
-      ...taxOf(l.unit_price * l.quantity, l.gst_rate ?? 0, inter),
+      ...taxOf(lineAmount(l.unit_price, l.quantity), l.gst_rate ?? 0, inter),
     }));
     return {
       id: null, note_no, created_at: nowSql(), total, reason: body.reason, items, inter_state: sale?.inter_state,
@@ -1030,7 +1098,7 @@ $('#purchase-supplier').onchange = async (e) => {
 };
 
 function purchaseTotal() {
-  return purchase.lines.reduce((s, l) => s + l.quantity * l.unit_cost, 0);
+  return purchase.lines.reduce((s, l) => s + lineAmount(l.unit_cost, l.quantity), 0);
 }
 
 function renderPurchase() {
@@ -1054,7 +1122,7 @@ function renderPurchase() {
     <li>
       <div class="grow">
         <div class="title">${esc(l.name)}${l.isNew ? ' <span class="badge">new</span>' : ''}</div>
-        <div class="sub">${l.quantity} × ${rupees(l.unit_cost)} = <strong>${rupees(l.quantity * l.unit_cost)}</strong></div>
+        <div class="sub">${fmtQty(l.quantity, l.unit)} × ${rupees(l.unit_cost)}${perUnit(l.unit)} = <strong>${rupees(lineAmount(l.unit_cost, l.quantity))}</strong></div>
       </div>
       <button class="btn remove danger" data-remove="${i}" aria-label="Remove">×</button>
     </li>`).join('');
@@ -1221,6 +1289,7 @@ async function startStockIn(barcode) {
   stockForm.classList.remove('hidden');
   $('#stock-hint').classList.add('hidden');
   (isNew ? stockForm.name : stockForm.quantity).focus();
+  setQtyStep(stockForm.dataset.mode === 'new' ? stockForm.unit.value : stockProduct.unit);
   stockForm.quantity.select();
 }
 
@@ -1246,6 +1315,7 @@ function startReturnLine(barcode) {
   stockForm.classList.remove('hidden');
   $('#stock-hint').classList.add('hidden');
   stockForm.quantity.focus();
+  setQtyStep(stockForm.dataset.mode === 'new' ? stockForm.unit.value : stockProduct.unit);
   stockForm.quantity.select();
 }
 
@@ -1255,8 +1325,11 @@ function closeStockForm() {
 }
 
 function addPurchaseLine(f) {
-  const quantity = parseInt(f.quantity.value, 10);
+  const quantity = readQty(f.quantity.value);
   const unit_cost = toPaise(f.unit_cost.value);
+  const unit = f.dataset.mode === 'new' ? f.unit.value : stockProduct.unit;
+  const problem = quantityProblem(f.dataset.mode === 'new' ? f.name.value.trim() || 'This item' : stockProduct.name, unit, quantity);
+  if (problem) return toast(problem, true);
   const barcode = f.barcode.value;
   const line = purchase.lines.find((l) => l.barcode === barcode);
   if (returning()) {
@@ -1266,14 +1339,14 @@ function addPurchaseLine(f) {
     if (!stockProduct.cached && want > stockProduct.quantity) return toast(`Only ${stockProduct.quantity} in stock`, true);
   }
   if (line) {
-    line.quantity += quantity;
+    line.quantity = round3(line.quantity + quantity);
     line.unit_cost = unit_cost;
   } else {
     purchase.lines.push(f.dataset.mode === 'new'
       ? { barcode, quantity, unit_cost, isNew: true, name: f.name.value.trim(), price: toPaise(f.price.value),
           hsn: f.hsn.value.trim() || undefined, unit: f.unit.value,
           gst_rate: Number(f.gst_rate.value), low_stock: parseInt(f.low_stock.value, 10) || 0 }
-      : { barcode, quantity, unit_cost, isNew: false, name: stockProduct.name });
+      : { barcode, quantity, unit_cost, isNew: false, name: stockProduct.name, unit: stockProduct.unit });
   }
   savePurchaseDraft();
   renderPurchase();
@@ -1281,12 +1354,24 @@ function addPurchaseLine(f) {
   closeStockForm();
 }
 
+// Whole numbers for packets and pieces; up to 3 decimals for KGS, LTR, MTR.
+function setQtyStep(unit) {
+  const loose = isLoose(unit);
+  Object.assign(stockForm.quantity, { step: loose ? '0.001' : '1', min: loose ? '0.001' : '1', inputMode: loose ? 'decimal' : 'numeric' });
+  stockForm.low_stock.step = loose ? '0.001' : '1';
+  $('#qty-unit').textContent = loose ? `(${UNIT_SHORT[unit]})` : '';
+}
+stockForm.unit.addEventListener('change', () => setQtyStep(stockForm.unit.value));
+
 $('#stock-cancel').onclick = closeStockForm;
 stockForm.onsubmit = async (e) => {
   e.preventDefault();
   const f = stockForm;
   if (inPurchase()) return addPurchaseLine(f);
-  const body = { barcode: f.barcode.value, quantity: parseInt(f.quantity.value, 10), client_id: newClientId() };
+  const body = { barcode: f.barcode.value, quantity: readQty(f.quantity.value), client_id: newClientId() };
+  const problem = quantityProblem(f.dataset.mode === 'new' ? f.name.value.trim() || 'This item' : stockProduct.name,
+    f.dataset.mode === 'new' ? f.unit.value : stockProduct.unit, body.quantity);
+  if (problem) return toast(problem, true);
   if (f.dataset.mode === 'new') {
     Object.assign(body, {
       name: f.name.value,
@@ -1302,7 +1387,7 @@ stockForm.onsubmit = async (e) => {
     if ((await getOutbox()).length) await trySync();
     const { product, created } = await api('/stock-in', { method: 'POST', body });
     await catalogUpsert(product);
-    toast(`${created ? 'Added' : 'Restocked'} ${product.name} — now ${product.quantity} in stock`);
+    toast(`${created ? 'Added' : 'Restocked'} ${product.name} — now ${fmtQty(product.quantity, product.unit)} in stock`);
     closeStockForm();
   } catch (err) {
     if (!err.offline) return toast(err.message, true);
@@ -1381,7 +1466,7 @@ async function editProduct(id) {
       </div>
       ${GST_RATES.includes(p.gst_rate) ? '' : `<p class="notice">${p.gst_rate}% is no longer a GST rate. Pick the current rate for this item.</p>`}
       <label>Correct stock (damaged, lost, recount): + or − units
-        <input name="change" type="number" step="1" placeholder="e.g. -2"></label>
+        <input name="change" type="number" step="any" inputmode="decimal" placeholder="${isLoose(p.unit) ? 'e.g. -0.25' : 'e.g. -2'}"></label>
       <div class="actions">
         <button class="btn ghost" type="button" data-close>Close</button>
         <button class="btn primary">Save</button>
@@ -1410,7 +1495,7 @@ async function editProduct(id) {
           unit: form.unit.value,
         },
       });
-      const change = parseInt(form.change.value, 10);
+      const change = readQty(form.change.value);
       if (change) updated = await api(`/products/${id}/stock`, { method: 'POST', body: { change, reason: 'adjustment', note: 'Manual correction' } });
       await catalogUpsert(updated);
       modal.close();

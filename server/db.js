@@ -5,7 +5,8 @@ import { dirname } from 'node:path';
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { currentUser } from './context.js';
 import {
-  GST_RATES, STATES, UQC, financialYear, gstinValid, hsnValid, invoiceProblem, localDate, parseDocNumber, splitTax, stateLabel, taxOf,
+  GST_RATES, STATES, UQC, financialYear, gstinValid, hsnValid, invoiceProblem, isLoose, lineAmount, localDate, parseDocNumber,
+  quantityProblem, round3, splitTax, stateLabel, taxOf,
 } from '../public/gst.js';
 
 // Tables whose CHECK rules have grown since the first release. Older databases are rebuilt
@@ -371,6 +372,12 @@ function pinMatches(pin, stored) {
 const tokenHash = (token) => createHash('sha256').update(String(token)).digest('hex');
 const publicUser = ({ pin_hash, failed_logins, locked_until, ...u }) => ({ ...u, active: Boolean(u.active) });
 const uid = () => currentUser()?.id ?? null;
+
+// Whole units for packets and pieces; up to 3 decimals for KGS, LTR, MTR.
+function checkQuantity(product, quantity) {
+  const problem = quantityProblem(product.name, product.unit, quantity);
+  if (problem) throw new HttpError(400, problem);
+}
 
 export const DEFAULT_SHOP = {
   legal_name: '', trade_name: '', address: '', state_code: '', gstin: '', phone: '', email: '',
@@ -825,6 +832,7 @@ class Store {
     barcode, name, price, cost = 0, gst_rate = 0, quantity = 0, low_stock = 5, hsn = null, unit = 'NOS',
   }, clientId = null) {
     if (this.getByBarcode(barcode)) throw new HttpError(409, `Barcode ${barcode} already exists`);
+    if (quantity) checkQuantity({ name, unit }, quantity);
     return this.transaction(() => {
       const { lastInsertRowid: id } = this.db
         .prepare(
@@ -842,6 +850,9 @@ class Store {
     const product = this.getProduct(id);
     if (!product) throw new HttpError(404, 'Product not found');
     const allowed = ['name', 'price', 'cost', 'gst_rate', 'low_stock', 'barcode', 'hsn', 'unit'];
+    if (fields.unit && !isLoose(fields.unit) && !Number.isInteger(product.quantity)) {
+      throw new HttpError(409, `${product.name} has ${product.quantity} in stock — correct the stock to a whole number before counting it in ${fields.unit}`);
+    }
     const sets = Object.keys(fields).filter((k) => allowed.includes(k));
     if (sets.length) {
       this.transaction(() => {
@@ -861,11 +872,12 @@ class Store {
     return this.transaction(() => {
       const product = this.getProduct(id);
       if (!product) throw new HttpError(404, 'Product not found');
-      if (product.quantity + change < 0) {
+      checkQuantity(product, Math.abs(change));
+      if (round3(product.quantity + change) < 0) {
         throw new HttpError(409, `Only ${product.quantity} of ${product.name} in stock`);
       }
       this.db
-        .prepare("UPDATE products SET quantity = quantity + ?, updated_at = datetime('now') WHERE id = ?")
+        .prepare("UPDATE products SET quantity = ROUND(quantity + ?, 3), updated_at = datetime('now') WHERE id = ?")
         .run(change, id);
       this.#move(id, change, reason, null, note, clientId);
       return this.getProduct(id);
@@ -1020,7 +1032,7 @@ class Store {
       const supplier = this.#resolveParty(
         PARTIES.supplier, { id: supplier_id, name: supplier_name, phone: supplier_phone }, { create: true }
       );
-      const total = items.reduce((s, i) => s + i.quantity * i.unit_cost, 0);
+      const total = items.reduce((s, i) => s + lineAmount(i.unit_cost, i.quantity), 0);
       if (paid > total) throw new HttpError(400, 'Paid amount cannot exceed the bill total');
 
       const { lastInsertRowid: purchaseId } = this.db
@@ -1046,8 +1058,9 @@ class Store {
             .run(item.barcode, item.name, item.price, item.unit_cost, item.gst_rate ?? 0, item.low_stock ?? 5, item.hsn ?? null, item.unit ?? 'NOS');
           p = this.getProduct(lastInsertRowid);
         }
+        checkQuantity(p, item.quantity);
         this.db
-          .prepare("UPDATE products SET quantity = quantity + ?, cost = ?, updated_at = datetime('now') WHERE id = ?")
+          .prepare("UPDATE products SET quantity = ROUND(quantity + ?, 3), cost = ?, updated_at = datetime('now') WHERE id = ?")
           .run(item.quantity, item.unit_cost, p.id);
         this.db
           .prepare(
@@ -1055,7 +1068,7 @@ class Store {
              VALUES (?, ?, 'stock_in', ?, ?, ?)`
           )
           .run(p.id, item.quantity, purchaseId, `Purchase from ${supplier.name}`, uid());
-        insertItem.run(purchaseId, p.id, p.barcode, p.name, item.quantity, item.unit_cost, item.quantity * item.unit_cost);
+        insertItem.run(purchaseId, p.id, p.barcode, p.name, item.quantity, item.unit_cost, lineAmount(item.unit_cost, item.quantity));
       }
 
       const ledger = this.db.prepare(
@@ -1119,7 +1132,7 @@ class Store {
       const merged = new Map();
       for (const item of items) {
         const line = merged.get(item.barcode) ?? { ...item, quantity: 0 };
-        line.quantity += item.quantity;
+        line.quantity = round3(line.quantity + item.quantity);
         if (item.unit_cost !== undefined) line.unit_cost = item.unit_cost;
         merged.set(item.barcode, line);
       }
@@ -1128,6 +1141,7 @@ class Store {
       for (const item of merged.values()) {
         const p = this.getByBarcode(item.barcode);
         if (!p) throw new HttpError(404, `Product ${item.barcode} not found`);
+        checkQuantity(p, item.quantity);
         if (p.quantity < item.quantity) throw new HttpError(409, `Only ${p.quantity} of ${p.name} in stock to return`);
         let unitCost = item.unit_cost ?? p.cost;
         if (billLines) {
@@ -1138,7 +1152,7 @@ class Store {
           }
           unitCost = item.unit_cost ?? billLine.unit_cost;
         }
-        lines.push({ p, quantity: item.quantity, unit_cost: unitCost, line_total: unitCost * item.quantity });
+        lines.push({ p, quantity: item.quantity, unit_cost: unitCost, line_total: lineAmount(unitCost, item.quantity) });
       }
       const total = lines.reduce((s, l) => s + l.line_total, 0);
 
@@ -1157,7 +1171,7 @@ class Store {
       for (const { p, quantity, unit_cost, line_total } of lines) {
         insertItem.run(returnId, p.id, p.barcode, p.name, quantity, unit_cost, line_total);
         this.db
-          .prepare("UPDATE products SET quantity = quantity - ?, updated_at = datetime('now') WHERE id = ?")
+          .prepare("UPDATE products SET quantity = ROUND(quantity - ?, 3), updated_at = datetime('now') WHERE id = ?")
           .run(quantity, p.id);
         this.db
           .prepare(
@@ -1191,7 +1205,7 @@ class Store {
          FROM purchase_items pi WHERE pi.purchase_id = ? GROUP BY pi.product_id`
       )
       .all(purchaseId)
-      .map((l) => ({ ...l, returnable: l.bought - l.returned }));
+      .map((l) => ({ ...l, bought: round3(l.bought), returned: round3(l.returned), returnable: round3(l.bought - l.returned) }));
   }
 
   getReturn(id) {
@@ -1268,7 +1282,7 @@ class Store {
          ORDER BY COALESCE(b.amount, 0) - COALESCE(k.amount, 0) DESC, pr.name COLLATE NOCASE`
       )
       .all(supplierId, from, to, supplierId, from, to)
-      .map((i) => ({ ...i, avg_cost: i.bought_qty ? Math.round(i.bought_amount / i.bought_qty) : null }));
+      .map((i) => ({ ...i, bought_qty: round3(i.bought_qty), returned_qty: round3(i.returned_qty), avg_cost: i.bought_qty ? Math.round(i.bought_amount / i.bought_qty) : null }));
     const summary = this.supplierReport({ from, to }).rows.find((r) => r.id === supplierId) ?? {
       bills: 0, purchased: 0, returned: 0, net_purchased: 0, paid: 0, refunded: 0, balance: supplier.balance,
     };
@@ -1344,18 +1358,19 @@ class Store {
         const p = item.product_id ? this.getProduct(item.product_id) : this.getByBarcode(item.barcode);
         if (!p) throw new HttpError(404, `Product ${item.product_id ?? item.barcode} not found`);
         const line = wanted.get(p.id) ?? { p, quantity: 0, printed: allowOversell && item.unit_price !== undefined ? item : null };
-        line.quantity += item.quantity;
+        line.quantity = round3(line.quantity + item.quantity);
         wanted.set(p.id, line);
       }
 
       const lines = [];
       for (const { p, quantity, printed } of wanted.values()) {
+        checkQuantity({ name: p.name, unit: printed?.unit ?? p.unit }, quantity);
         if (p.quantity < quantity && !allowOversell) {
           throw new HttpError(409, `Only ${p.quantity} of ${p.name} in stock`);
         }
         const unit_price = printed?.unit_price ?? p.price;
         lines.push({
-          p, quantity, unit_price, line_total: unit_price * quantity, name: p.name,
+          p, quantity, unit_price, line_total: lineAmount(unit_price, quantity), name: p.name,
           gst_rate: printed?.gst_rate ?? p.gst_rate, hsn: printed?.hsn ?? p.hsn, unit: printed?.unit ?? p.unit,
         });
       }
@@ -1404,7 +1419,7 @@ class Store {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       const decrement = this.db.prepare(
-        "UPDATE products SET quantity = MAX(quantity - ?, 0), updated_at = datetime('now') WHERE id = ?"
+        "UPDATE products SET quantity = MAX(ROUND(quantity - ?, 3), 0), updated_at = datetime('now') WHERE id = ?"
       );
       const warnings = [];
       lines.forEach(({ p, quantity, unit_price, gst_rate, line_total, hsn, unit }, i) => {
@@ -1413,7 +1428,7 @@ class Store {
           hsn, unit, t.taxable, t.cgst, t.sgst, t.igst);
         decrement.run(quantity, p.id);
         this.#move(p.id, -quantity, 'sale', saleId, null);
-        const shortfall = quantity - p.quantity;
+        const shortfall = round3(quantity - p.quantity);
         if (shortfall > 0) {
           this.#move(p.id, shortfall, 'adjustment', saleId, `Sold ${shortfall} more than recorded stock while offline — please recount`);
           warnings.push(`${p.name}: sold ${shortfall} more than in stock — please recount`);
@@ -1492,8 +1507,8 @@ class Store {
     const stock = this.db
       .prepare(
         `SELECT COUNT(*) AS products,
-                COALESCE(SUM(quantity), 0) AS units,
-                COALESCE(SUM(quantity * price), 0) AS stock_value,
+                ROUND(COALESCE(SUM(quantity), 0), 3) AS units,
+                ROUND(COALESCE(SUM(quantity * price), 0)) AS stock_value,
                 COALESCE(SUM(CASE WHEN quantity <= low_stock THEN 1 ELSE 0 END), 0) AS low_stock
          FROM products`
       )
@@ -1528,7 +1543,7 @@ class Store {
       .all(saleId)
       .map((l) => {
         const paid = sale.subtotal ? l.line_total - (sale.discount * l.line_total) / sale.subtotal : 0;
-        return { ...l, returnable: l.sold - l.returned, unit_refund: Math.round(paid / l.sold) };
+        return { ...l, sold: round3(l.sold), returned: round3(l.returned), returnable: round3(l.sold - l.returned), unit_refund: Math.round(paid / l.sold) };
       });
   }
 
@@ -1566,12 +1581,13 @@ class Store {
       }
 
       const merged = new Map();
-      for (const item of items) merged.set(item.barcode, (merged.get(item.barcode) ?? 0) + item.quantity);
+      for (const item of items) merged.set(item.barcode, round3((merged.get(item.barcode) ?? 0) + item.quantity));
 
       const lines = [];
       for (const [barcode, quantity] of merged) {
         const p = this.getByBarcode(barcode);
         if (!p) throw new HttpError(404, `Product ${barcode} not found`);
+        checkQuantity(p, quantity);
         if (billLines) {
           const line = billLines.find((l) => l.product_id === p.id);
           if (!line) throw new HttpError(400, `${p.name} is not on bill #${sale_id}`);
@@ -1586,7 +1602,7 @@ class Store {
           lines.push({ p, quantity, unit_price: p.price, unit_cost: p.cost, gst_rate: p.gst_rate, hsn: p.hsn, unit: p.unit });
         }
       }
-      const total = lines.reduce((s, l) => s + l.unit_price * l.quantity, 0);
+      const total = lines.reduce((s, l) => s + lineAmount(l.unit_price, l.quantity), 0);
       if (currentUser()?.role === 'cashier') this.#checkCashierReturn(shop, sale, total, created_at);
 
       let customer = null;
@@ -1600,7 +1616,7 @@ class Store {
 
       // Reverse tax the way the invoice charged it (IGST for an inter-state invoice).
       const interState = Boolean(sale?.inter_state);
-      const taxes = lines.map((l) => taxOf(l.unit_price * l.quantity, l.gst_rate, interState));
+      const taxes = lines.map((l) => taxOf(lineAmount(l.unit_price, l.quantity), l.gst_rate, interState));
       const sum = (k) => taxes.reduce((s, x) => s + x[k], 0);
       const number = this.#claimNumber('credit_note', note_no, created_at);
 
@@ -1621,11 +1637,11 @@ class Store {
       );
       lines.forEach(({ p, quantity, unit_price, unit_cost, gst_rate, hsn, unit }, i) => {
         const t = taxes[i];
-        insertItem.run(returnId, p.id, p.barcode, p.name, quantity, unit_price, unit_cost, gst_rate, unit_price * quantity,
+        insertItem.run(returnId, p.id, p.barcode, p.name, quantity, unit_price, unit_cost, gst_rate, lineAmount(unit_price, quantity),
           hsn, unit, t.taxable, t.cgst, t.sgst, t.igst);
         if (restock) {
           this.db
-            .prepare("UPDATE products SET quantity = quantity + ?, updated_at = datetime('now') WHERE id = ?")
+            .prepare("UPDATE products SET quantity = ROUND(quantity + ?, 3), updated_at = datetime('now') WHERE id = ?")
             .run(quantity, p.id);
           this.db
             .prepare(
@@ -1772,6 +1788,8 @@ class Store {
       const gross_profit = net_sales - cogs;
       return {
         ...b,
+        qty_sold: round3(b.qty_sold),
+        qty_returned: round3(b.qty_returned),
         gross_sales: Math.round(b.gross_sales),
         returns: Math.round(b.returns),
         net_sales, cogs, gross_profit,
@@ -1850,7 +1868,7 @@ class Store {
           hsn: i.hsn ?? '', description: i.name, uqc: `${unitCode}-${UQC[unitCode] ?? 'OTHERS'}`, quantity: 0, value: 0,
           rate: i.gst_rate, taxable: 0, igst: 0, cgst: 0, sgst: 0,
         }).get(key);
-        h.quantity += sign * i.quantity;
+        h.quantity = round3(h.quantity + sign * i.quantity);
         h.value += sign * (i.taxable + i.igst + i.cgst + i.sgst);
         add(h, i, sign);
       }

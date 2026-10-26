@@ -66,7 +66,7 @@ export async function catalogUpsert(product) {
 
 export async function catalogChangeQty(barcode, delta) {
   const p = await catalogFind(barcode);
-  if (p) await catalogUpsert({ ...p, quantity: Math.max(0, p.quantity + delta) });
+  if (p) await catalogUpsert({ ...p, quantity: Math.max(0, Math.round((p.quantity + delta) * 1000) / 1000) });
 }
 
 // --- outbox -------------------------------------------------------------
