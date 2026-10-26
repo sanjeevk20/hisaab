@@ -11,10 +11,11 @@ CREATE TABLE IF NOT EXISTS stock_movements (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   product_id   INTEGER NOT NULL REFERENCES products(id),
   change       INTEGER NOT NULL,
-  reason       TEXT NOT NULL CHECK (reason IN ('stock_in', 'sale', 'adjustment', 'purchase_return')),
+  reason       TEXT NOT NULL CHECK (reason IN ('stock_in', 'sale', 'adjustment', 'purchase_return', 'sale_return')),
   sale_id      INTEGER REFERENCES sales(id),
   purchase_id  INTEGER REFERENCES purchases(id),
   return_id    INTEGER REFERENCES purchase_returns(id),
+  sale_return_id INTEGER REFERENCES sale_returns(id),
   note         TEXT,
   client_id    TEXT,
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
@@ -36,9 +37,26 @@ CREATE TABLE IF NOT EXISTS supplier_ledger (
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );`;
 
+const LEDGER_ENTRIES = `
+-- Udhaar (credit) khata. amount is always positive; the type says which way it moves the balance.
+-- 'payment' and 'return' reduce what the customer owes.
+CREATE TABLE IF NOT EXISTS ledger_entries (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id     INTEGER NOT NULL REFERENCES customers(id),
+  type            TEXT NOT NULL CHECK (type IN ('opening', 'credit_sale', 'payment', 'return')),
+  amount          INTEGER NOT NULL CHECK (amount > 0),
+  sale_id         INTEGER REFERENCES sales(id),
+  sale_return_id  INTEGER REFERENCES sale_returns(id),
+  method          TEXT,
+  note            TEXT,
+  client_id       TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);`;
+
 const REBUILDS = [
-  ['stock_movements', STOCK_MOVEMENTS, "'purchase_return'"],
+  ['stock_movements', STOCK_MOVEMENTS, 'sale_return_id'],
   ['supplier_ledger', SUPPLIER_LEDGER, "'refund'"],
+  ['ledger_entries', LEDGER_ENTRIES, 'sale_return_id'],
 ];
 
 const SCHEMA = `
@@ -85,23 +103,40 @@ CREATE TABLE IF NOT EXISTS sale_items (
   name        TEXT NOT NULL,
   quantity    INTEGER NOT NULL CHECK (quantity > 0),
   unit_price  INTEGER NOT NULL,
+  unit_cost   INTEGER,                                -- product cost when sold, for profit
   gst_rate    REAL NOT NULL,
   line_total  INTEGER NOT NULL
 );
 
 ${STOCK_MOVEMENTS}
 
--- Udhaar (credit) khata. amount is always positive; the type says which way it moves the balance.
-CREATE TABLE IF NOT EXISTS ledger_entries (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  customer_id  INTEGER NOT NULL REFERENCES customers(id),
-  type         TEXT NOT NULL CHECK (type IN ('opening', 'credit_sale', 'payment')),
-  amount       INTEGER NOT NULL CHECK (amount > 0),
-  sale_id      INTEGER REFERENCES sales(id),
-  method       TEXT,
-  note         TEXT,
-  client_id    TEXT,
-  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+${LEDGER_ENTRIES}
+
+-- Goods a customer brings back. Refunded in cash/UPI/card, or taken off their udhaar ('khata').
+-- restock = 0 means the item was damaged and does not go back on the shelf.
+CREATE TABLE IF NOT EXISTS sale_returns (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  sale_id        INTEGER REFERENCES sales(id),
+  customer_id    INTEGER REFERENCES customers(id),
+  total          INTEGER NOT NULL,
+  refund_method  TEXT NOT NULL CHECK (refund_method IN ('cash', 'upi', 'card', 'khata')),
+  restock        INTEGER NOT NULL DEFAULT 1,
+  reason         TEXT,
+  client_id      TEXT,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sale_return_items (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  return_id   INTEGER NOT NULL REFERENCES sale_returns(id),
+  product_id  INTEGER NOT NULL REFERENCES products(id),
+  barcode     TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  quantity    INTEGER NOT NULL CHECK (quantity > 0),
+  unit_price  INTEGER NOT NULL,                       -- refunded per unit
+  unit_cost   INTEGER NOT NULL,                       -- cost of the unit, for profit
+  gst_rate    REAL NOT NULL DEFAULT 0,
+  line_total  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS suppliers (
@@ -178,6 +213,10 @@ CREATE INDEX IF NOT EXISTS idx_returns_supplier ON purchase_returns(supplier_id)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_returns_client ON purchase_returns(client_id) WHERE client_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_return_items_return ON purchase_return_items(return_id);
 CREATE INDEX IF NOT EXISTS idx_purchases_supplier ON purchases(supplier_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_sale_returns_sale ON sale_returns(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_returns_created ON sale_returns(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sale_returns_client ON sale_returns(client_id) WHERE client_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sale_return_items_return ON sale_return_items(return_id);
 `;
 
 // Columns added after the first release; applied to existing databases on open.
@@ -187,6 +226,8 @@ const MIGRATIONS = [
   ['sales', 'client_id', 'TEXT'],
   ['stock_movements', 'client_id', 'TEXT'],
   ['stock_movements', 'purchase_id', 'INTEGER REFERENCES purchases(id)'],
+  // Sales made before this column existed are valued at the product's cost price at upgrade time.
+  ['sale_items', 'unit_cost', 'INTEGER', 'UPDATE sale_items SET unit_cost = (SELECT cost FROM products WHERE id = product_id)'],
 ];
 const POST_MIGRATION = `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_client ON sales(client_id) WHERE client_id IS NOT NULL;
@@ -218,9 +259,12 @@ export function openDb(path = 'data/hisaab.db') {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec(SCHEMA);
-  for (const [table, column, type] of MIGRATIONS) {
+  for (const [table, column, type, backfill] of MIGRATIONS) {
     const exists = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
-    if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    if (!exists) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      if (backfill) db.exec(backfill);
+    }
   }
   for (const [table, createSql, marker] of REBUILDS) rebuildIfOutdated(db, table, createSql, marker);
   db.exec(SCHEMA); // recreate indexes dropped by a rebuild
@@ -817,15 +861,15 @@ class Store {
         );
 
       const insertItem = this.db.prepare(
-        `INSERT INTO sale_items (sale_id, product_id, barcode, name, quantity, unit_price, gst_rate, line_total)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO sale_items (sale_id, product_id, barcode, name, quantity, unit_price, unit_cost, gst_rate, line_total)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       const decrement = this.db.prepare(
         "UPDATE products SET quantity = MAX(quantity - ?, 0), updated_at = datetime('now') WHERE id = ?"
       );
       const warnings = [];
       for (const { p, quantity, line_total } of lines) {
-        insertItem.run(saleId, p.id, p.barcode, p.name, quantity, p.price, p.gst_rate, line_total);
+        insertItem.run(saleId, p.id, p.barcode, p.name, quantity, p.price, p.cost, p.gst_rate, line_total);
         decrement.run(quantity, p.id);
         this.#move(p.id, -quantity, 'sale', saleId, null);
         const shortfall = quantity - p.quantity;
@@ -887,10 +931,223 @@ class Store {
     const { udhaar_due } = this.db
       .prepare(`SELECT ${BALANCE_SQL} AS udhaar_due FROM ledger_entries l`)
       .get();
+    const { refunds } = this.db
+      .prepare('SELECT COALESCE(SUM(total), 0) AS refunds FROM sale_returns WHERE created_at >= ?')
+      .get(since);
     const { supplier_due } = this.db
       .prepare(`SELECT ${BALANCE_SQL} AS supplier_due FROM supplier_ledger l`)
       .get();
-    return { ...sales, ...stock, udhaar_due, supplier_due };
+    return { ...sales, refunds, ...stock, udhaar_due, supplier_due };
+  }
+
+  // --- customer returns -------------------------------------------------
+
+  // Lines of a bill with how many units can still come back, and what each one refunds:
+  // the price actually paid, i.e. the unit price less its share of the bill discount.
+  returnableFromSale(saleId) {
+    const sale = this.db.prepare('SELECT subtotal, discount FROM sales WHERE id = ?').get(saleId);
+    if (!sale) return null;
+    return this.db
+      .prepare(
+        `SELECT si.product_id, si.barcode, si.name, SUM(si.quantity) AS sold, SUM(si.line_total) AS line_total,
+                MAX(si.unit_cost) AS unit_cost, MAX(si.gst_rate) AS gst_rate,
+                COALESCE((SELECT SUM(ri.quantity) FROM sale_return_items ri JOIN sale_returns r ON r.id = ri.return_id
+                          WHERE r.sale_id = si.sale_id AND ri.product_id = si.product_id), 0) AS returned
+         FROM sale_items si WHERE si.sale_id = ? GROUP BY si.product_id ORDER BY MIN(si.id)`
+      )
+      .all(saleId)
+      .map((l) => {
+        const paid = sale.subtotal ? l.line_total - (sale.discount * l.line_total) / sale.subtotal : 0;
+        return { ...l, returnable: l.sold - l.returned, unit_refund: Math.round(paid / l.sold) };
+      });
+  }
+
+  // Takes goods back from a customer. With sale_id, lines must be on that bill, can't exceed what
+  // is left to return, and refund what was paid; without it, the product's current price is refunded.
+  // refund_method 'khata' takes the amount off the customer's udhaar (it may go into advance).
+  // restock: false for damaged goods — recorded, but not put back into stock.
+  createSaleReturn({
+    sale_id = null, items, refund_method = 'cash', restock = true, reason = null,
+    customer_id = null, customer_name = null, customer_phone = null, client_id = null, created_at = null,
+  }) {
+    return this.transaction(() => {
+      if (client_id) {
+        const seen = this.db.prepare('SELECT id FROM sale_returns WHERE client_id = ?').get(client_id);
+        if (seen) return { ...this.getSaleReturn(seen.id), duplicate: true };
+      }
+      let sale = null, billLines = null;
+      if (sale_id) {
+        sale = this.db.prepare('SELECT * FROM sales WHERE id = ?').get(sale_id);
+        if (!sale) throw new HttpError(404, `Bill #${sale_id} not found`);
+        billLines = this.returnableFromSale(sale_id);
+      }
+
+      const merged = new Map();
+      for (const item of items) merged.set(item.barcode, (merged.get(item.barcode) ?? 0) + item.quantity);
+
+      const lines = [];
+      for (const [barcode, quantity] of merged) {
+        const p = this.getByBarcode(barcode);
+        if (!p) throw new HttpError(404, `Product ${barcode} not found`);
+        if (billLines) {
+          const line = billLines.find((l) => l.product_id === p.id);
+          if (!line) throw new HttpError(400, `${p.name} is not on bill #${sale_id}`);
+          if (quantity > line.returnable) {
+            throw new HttpError(409, `Only ${line.returnable} of ${p.name} left to return from bill #${sale_id}`);
+          }
+          lines.push({ p, quantity, unit_price: line.unit_refund, unit_cost: line.unit_cost ?? p.cost, gst_rate: line.gst_rate });
+        } else {
+          lines.push({ p, quantity, unit_price: p.price, unit_cost: p.cost, gst_rate: p.gst_rate });
+        }
+      }
+      const total = lines.reduce((s, l) => s + l.unit_price * l.quantity, 0);
+
+      let customer = null;
+      if (sale?.customer_id) customer = this.db.prepare('SELECT * FROM customers WHERE id = ?').get(sale.customer_id);
+      if (!customer && (customer_id || customer_name || customer_phone)) {
+        customer = this.#resolveParty(
+          PARTIES.customer, { id: customer_id, name: customer_name, phone: customer_phone }, { create: refund_method === 'khata' }
+        );
+      }
+      if (refund_method === 'khata' && !customer) throw new HttpError(400, 'Taking a return off udhaar needs the customer');
+
+      const { lastInsertRowid: returnId } = this.db
+        .prepare(
+          `INSERT INTO sale_returns (sale_id, customer_id, total, refund_method, restock, reason, client_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+        )
+        .run(sale_id, customer?.id ?? null, total, refund_method, restock ? 1 : 0, reason, client_id, created_at);
+
+      const insertItem = this.db.prepare(
+        `INSERT INTO sale_return_items (return_id, product_id, barcode, name, quantity, unit_price, unit_cost, gst_rate, line_total)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const { p, quantity, unit_price, unit_cost, gst_rate } of lines) {
+        insertItem.run(returnId, p.id, p.barcode, p.name, quantity, unit_price, unit_cost, gst_rate, unit_price * quantity);
+        if (restock) {
+          this.db
+            .prepare("UPDATE products SET quantity = quantity + ?, updated_at = datetime('now') WHERE id = ?")
+            .run(quantity, p.id);
+          this.db
+            .prepare(
+              `INSERT INTO stock_movements (product_id, change, reason, sale_id, sale_return_id, note)
+               VALUES (?, ?, 'sale_return', ?, ?, ?)`
+            )
+            .run(p.id, quantity, sale_id, returnId, `Customer return${reason ? ' — ' + reason : ''}`);
+        }
+      }
+      if (refund_method === 'khata' && total > 0) {
+        this.db
+          .prepare(
+            `INSERT INTO ledger_entries (customer_id, type, amount, sale_id, sale_return_id, note, created_at)
+             VALUES (?, 'return', ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+          )
+          .run(customer.id, total, sale_id, returnId, reason, created_at);
+      }
+      return { ...this.getSaleReturn(returnId), duplicate: false };
+    });
+  }
+
+  getSaleReturn(id) {
+    const r = this.db
+      .prepare('SELECT r.*, c.name AS customer_name FROM sale_returns r LEFT JOIN customers c ON c.id = r.customer_id WHERE r.id = ?')
+      .get(id);
+    if (!r) return null;
+    r.restock = Boolean(r.restock);
+    r.items = this.db.prepare('SELECT * FROM sale_return_items WHERE return_id = ? ORDER BY id').all(id);
+    return r;
+  }
+
+  listSaleReturns({ saleId, limit = 50 } = {}) {
+    let sql = 'SELECT r.*, c.name AS customer_name FROM sale_returns r LEFT JOIN customers c ON c.id = r.customer_id';
+    const params = [];
+    if (saleId) {
+      sql += ' WHERE r.sale_id = ?';
+      params.push(saleId);
+    }
+    sql += ' ORDER BY r.created_at DESC, r.id DESC LIMIT ?';
+    params.push(limit);
+    return this.db.prepare(sql).all(...params).map((r) => ({ ...r, restock: Boolean(r.restock) }));
+  }
+
+  // --- profit report ----------------------------------------------------
+
+  // Gross profit for [from, to): what customers paid (after bill discounts, less refunds) minus what
+  // those goods cost. Sold units are costed at the cost price when they were sold; returned units
+  // that went back on the shelf give their cost back, damaged ones don't. Amounts include GST;
+  // `tax` is the GST inside net sales, for shops that need profit before tax.
+  // tzOffset (minutes east of UTC, e.g. 330 for India) groups days in the shop's local time.
+  profitReport({ from, to, tzOffset = 0 }) {
+    const shift = `${tzOffset >= 0 ? '+' : '-'}${Math.abs(tzOffset)} minutes`;
+    const sold = this.db
+      .prepare(
+        `SELECT si.product_id, si.barcode, si.name, si.quantity, si.gst_rate, s.id AS sale_id,
+                si.line_total - (CASE WHEN s.subtotal > 0 THEN s.discount * si.line_total * 1.0 / s.subtotal ELSE 0 END) AS revenue,
+                si.quantity * COALESCE(si.unit_cost, p.cost) AS cost,
+                COALESCE(si.unit_cost, p.cost) = 0 AS no_cost,
+                date(s.created_at, ?) AS day
+         FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
+         WHERE s.created_at >= ? AND s.created_at < ?`
+      )
+      .all(shift, from, to);
+    const back = this.db
+      .prepare(
+        `SELECT ri.product_id, ri.barcode, ri.name, ri.quantity, ri.gst_rate, ri.line_total AS refund,
+                CASE WHEN r.restock THEN ri.quantity * ri.unit_cost ELSE 0 END AS cost_back,
+                date(r.created_at, ?) AS day
+         FROM sale_return_items ri JOIN sale_returns r ON r.id = ri.return_id
+         WHERE r.created_at >= ? AND r.created_at < ?`
+      )
+      .all(shift, from, to);
+
+    const blank = () => ({ qty_sold: 0, qty_returned: 0, gross_sales: 0, returns: 0, cogs: 0, tax: 0 });
+    const products = new Map(), days = new Map(), total = blank(), bills = new Set();
+    const missingCost = new Set();
+    const bucket = (map, key, init) => map.get(key) ?? map.set(key, { ...init(), ...blank() }).get(key);
+    const tax = (amount, rate) => (rate > 0 ? (amount * rate) / (100 + rate) : 0);
+
+    for (const l of sold) {
+      bills.add(l.sale_id);
+      if (l.no_cost) missingCost.add(l.product_id);
+      for (const b of [bucket(products, l.product_id, () => ({ product_id: l.product_id, barcode: l.barcode, name: l.name })),
+        bucket(days, l.day, () => ({ day: l.day })), total]) {
+        b.qty_sold += l.quantity;
+        b.gross_sales += l.revenue;
+        b.cogs += l.cost;
+        b.tax += tax(l.revenue, l.gst_rate);
+      }
+    }
+    for (const l of back) {
+      for (const b of [bucket(products, l.product_id, () => ({ product_id: l.product_id, barcode: l.barcode, name: l.name })),
+        bucket(days, l.day, () => ({ day: l.day })), total]) {
+        b.qty_returned += l.quantity;
+        b.returns += l.refund;
+        b.cogs -= l.cost_back;
+        b.tax -= tax(l.refund, l.gst_rate);
+      }
+    }
+
+    const finish = (b) => {
+      const net_sales = Math.round(b.gross_sales - b.returns);
+      const cogs = Math.round(b.cogs);
+      const gross_profit = net_sales - cogs;
+      return {
+        ...b,
+        gross_sales: Math.round(b.gross_sales),
+        returns: Math.round(b.returns),
+        net_sales, cogs, gross_profit,
+        tax: Math.round(b.tax),
+        margin_pct: net_sales > 0 ? Math.round((gross_profit / net_sales) * 1000) / 10 : null,
+      };
+    };
+    return {
+      from, to,
+      summary: { ...finish(total), bills: bills.size, products_without_cost: missingCost.size },
+      by_day: [...days.values()].map(finish).sort((a, b) => a.day.localeCompare(b.day)),
+      by_product: [...products.values()]
+        .map((p) => ({ ...finish(p), no_cost: missingCost.has(p.product_id) }))
+        .sort((a, b) => b.gross_profit - a.gross_profit || a.name.localeCompare(b.name)),
+    };
   }
 
   #move(productId, change, reason, saleId, note, clientId = null) {

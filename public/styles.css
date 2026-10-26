@@ -184,3 +184,15 @@ a.btn { text-decoration: none; text-align: center; }
 .toolbar select { flex: 1; }
 .amount-credit { color: var(--brand); font-weight: 700; white-space: nowrap; }
 .report-row .sub span + span::before { content: " · "; }
+#bill-mode { margin-bottom: 10px; }
+#report-side { grid-template-columns: repeat(3, 1fr); }
+.grow-title { flex: 1; }
+.toolbar select#profit-sort { flex: 0 1 auto; width: auto; }
+.amount-loss { color: var(--danger); font-weight: 700; white-space: nowrap; }
+.day-bars { display: flex; align-items: flex-end; gap: 3px; height: 96px; padding: 8px 10px 0;
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+.day-bars .bar { flex: 1 0 8px; max-width: 28px; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
+.day-bars .bar i { display: block; background: var(--brand); border-radius: 3px 3px 0 0; min-height: 2px; }
+.day-bars .bar.neg i { background: var(--danger); }
+.day-bars .bar span { font-size: 9px; color: var(--muted); text-align: center; line-height: 14px; }
+.return-max { font-size: 12px; color: var(--muted); }

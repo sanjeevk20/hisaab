@@ -7,7 +7,8 @@ import {
 // --- helpers ------------------------------------------------------------
 
 const $ = (sel, root = document) => root.querySelector(sel);
-const rupees = (paise) => '₹' + (paise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const rupees = (paise) => (paise < 0 ? '−₹' : '₹')
+  + (Math.abs(paise) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const toPaise = (v) => Math.round((parseFloat(v) || 0) * 100);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 // SQLite stores UTC 'YYYY-MM-DD HH:MM:SS'; show it in local time.
@@ -413,16 +414,204 @@ function showReceipt(sale) {
         <tr><td><strong>Total</strong></td><td><strong>${rupees(sale.total)}</strong></td></tr>
         ${sale.tax ? `<tr><td class="muted">Incl. GST</td><td class="muted">${rupees(sale.tax)}</td></tr>` : ''}
         <tr><td>Paid by</td><td>${PAY_LABEL[sale.payment_method]}</td></tr>
+        ${(sale.returns ?? []).map((r) => `<tr><td class="muted">Returned ${localTime(r.created_at)}</td><td class="muted">−${rupees(r.total)}</td></tr>`).join('')}
       </table>
     </div>
     <div class="actions">
       <button class="btn ghost" data-close>Close</button>
+      ${sale.id ? '<button class="btn" data-return>↩ Return</button>' : ''}
       <button class="btn" data-print>Print</button>
       <a class="btn primary" href="${whatsappLink(sale.customer_phone, receiptText(sale))}" target="_blank" rel="noopener">WhatsApp</a>
     </div>`);
   $('[data-close]', modal).onclick = () => modal.close();
   $('[data-print]', modal).onclick = () => window.print();
+  const back = $('[data-return]', modal);
+  if (back) back.onclick = () => {
+    modal.close();
+    showView('bill');
+    setBillMode('return');
+    loadReturnBill(sale.id);
+  };
 }
+
+// --- customer returns ---------------------------------------------------
+
+// Lines coming back, keyed by barcode: { barcode, name, quantity, unit_price, max }. With a bill
+// loaded, every line on it is listed (max = what can still come back) and scans count them up;
+// without one, scans add products at today's price.
+let billMode = 'sale';
+let ret = { sale: null, lines: new Map() };
+
+function setBillMode(mode) {
+  billMode = mode;
+  const isReturn = mode === 'return';
+  $('#bill-mode').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+  $('#return-panel').classList.toggle('hidden', !isReturn);
+  for (const sel of ['#cart', '#cart-empty', '#checkout']) $(sel).classList.toggle('hidden', isReturn);
+  $('[data-manual=bill] button').textContent = isReturn ? 'Return' : 'Add';
+  if (isReturn) renderReturn();
+  else renderCart();
+}
+$('#bill-mode').onclick = (e) => {
+  const mode = e.target.closest('button[data-mode]')?.dataset.mode;
+  if (mode) setBillMode(mode);
+};
+
+function resetReturn() {
+  ret = { sale: null, lines: new Map() };
+  $('#return-bill-form').bill.value = '';
+  $('#return-why').value = '';
+  $('#return-cust-name').value = '';
+  $('#return-cust-phone').value = '';
+  $('#return-restock').checked = true;
+  $('input[name=refund][value=cash]').checked = true;
+  renderReturn();
+}
+
+async function loadReturnBill(id) {
+  let sale;
+  try {
+    sale = await api(`/sales/${id}`);
+  } catch (err) {
+    return toast(err.offline ? 'Loading a bill needs internet — you can still scan items without it' : err.message, true);
+  }
+  ret = {
+    sale,
+    lines: new Map(sale.returnable.map((l) => [l.barcode, {
+      barcode: l.barcode, name: l.name, quantity: 0, unit_price: l.unit_refund, max: l.returnable,
+    }])),
+  };
+  $('#return-bill-form').bill.value = sale.id;
+  // Refund the way they paid; an udhaar bill comes off the udhaar.
+  const method = sale.payment_method === 'credit' ? 'khata' : sale.payment_method;
+  $(`input[name=refund][value=${method}]`).checked = true;
+  renderReturn();
+}
+
+$('#return-bill-form').onsubmit = (e) => {
+  e.preventDefault();
+  const id = parseInt(e.target.bill.value, 10);
+  if (id) loadReturnBill(id);
+  else resetReturn();
+};
+
+async function addToReturn(barcode) {
+  if (ret.sale) {
+    const line = ret.lines.get(barcode);
+    if (!line) return toast(`That item is not on bill #${ret.sale.id}`, true);
+    if (line.quantity >= line.max) return toast(`Only ${line.max} of ${line.name} can come back from this bill`, true);
+    line.quantity++;
+    toast(`${line.name} ×${line.quantity} to return`);
+    return renderReturn();
+  }
+  let p;
+  try {
+    p = await findProduct(barcode);
+  } catch (err) {
+    return toast(err.message, true);
+  }
+  if (!p) return toast(`Barcode ${barcode} is not in your inventory`, true);
+  const line = ret.lines.get(p.barcode) ?? { barcode: p.barcode, name: p.name, quantity: 0, unit_price: p.price, max: null };
+  line.quantity++;
+  ret.lines.set(p.barcode, line);
+  toast(`${p.name} ×${line.quantity} to return`);
+  renderReturn();
+}
+
+function renderReturn() {
+  const s = ret.sale;
+  const lines = [...ret.lines.values()];
+  $('#return-bill-info').textContent = s
+    ? `Bill #${s.id} · ${localTime(s.created_at)} · ${rupees(s.total)} · ${PAY_LABEL[s.payment_method]}${s.customer_name ? ' · ' + s.customer_name : ''}`
+      + (s.returns.length ? ` · already returned ${rupees(s.returns.reduce((t, r) => t + r.total, 0))}` : '')
+    : '';
+  $('#return-lines').innerHTML = lines.map((l) => `
+    <li>
+      <div class="grow">
+        <div class="title">${esc(l.name)}</div>
+        <div class="sub">${rupees(l.unit_price)} each${l.max !== null ? ` · <span class="return-max">${l.max ? `up to ${l.max}` : 'all returned already'}</span>` : ''}</div>
+      </div>
+      <div class="qty">
+        <button class="btn" data-rdec="${esc(l.barcode)}" aria-label="Less">−</button>
+        <span>${l.quantity}</span>
+        <button class="btn" data-rinc="${esc(l.barcode)}" aria-label="More">+</button>
+      </div>
+    </li>`).join('');
+  const total = lines.reduce((t, l) => t + l.unit_price * l.quantity, 0);
+  const any = lines.some((l) => l.quantity > 0);
+  $('#return-empty').classList.toggle('hidden', lines.length > 0);
+  $('#return-checkout').classList.toggle('hidden', !any);
+  $('#return-total').textContent = rupees(total);
+  const khata = $('input[name=refund]:checked').value === 'khata';
+  $('#return-customer').classList.toggle('hidden', !khata || Boolean(s?.customer_id));
+}
+
+$('#return-lines').onclick = (e) => {
+  const { rinc, rdec } = e.target.dataset;
+  const line = ret.lines.get(rinc ?? rdec);
+  if (!line) return;
+  if (rinc) {
+    if (line.max !== null && line.quantity >= line.max) return toast(`Only ${line.max} can come back from this bill`, true);
+    line.quantity++;
+  } else if (line.quantity > 0) {
+    line.quantity--;
+    if (!line.quantity && line.max === null) ret.lines.delete(line.barcode);
+  }
+  renderReturn();
+};
+$('#return-refund').onchange = renderReturn;
+$('#return-clear').onclick = () => confirm('Clear this return?') && resetReturn();
+
+$('#return-save').onclick = async (e) => {
+  const btn = e.currentTarget;
+  const lines = [...ret.lines.values()].filter((l) => l.quantity > 0);
+  const refund_method = $('input[name=refund]:checked').value;
+  const restock = $('#return-restock').checked;
+  const needsCustomer = refund_method === 'khata' && !ret.sale?.customer_id;
+  const customer_name = needsCustomer ? $('#return-cust-name').value.trim() || undefined : undefined;
+  const customer_phone = needsCustomer ? $('#return-cust-phone').value.trim() || undefined : undefined;
+  if (needsCustomer && !customer_name && !customer_phone) return toast('Enter the customer whose udhaar this comes off', true);
+  const total = lines.reduce((t, l) => t + l.unit_price * l.quantity, 0);
+  const body = {
+    sale_id: ret.sale?.id,
+    items: lines.map((l) => ({ barcode: l.barcode, quantity: l.quantity })),
+    refund_method, restock, customer_name, customer_phone,
+    reason: $('#return-why').value.trim() || undefined,
+    client_id: newClientId(),
+  };
+  const who = ret.sale?.customer_name ?? customer_name ?? 'the customer';
+  const finish = async (offline) => {
+    if (restock) for (const l of lines) await catalogChangeQty(l.barcode, l.quantity);
+    resetReturn();
+    openModal(`
+      <h2>Return saved${offline ? ' (offline)' : ''}</h2>
+      <p style="font-size:20px"><strong>${refund_method === 'khata'
+        ? `${rupees(total)} taken off ${esc(who)}'s udhaar`
+        : `Give back ${rupees(total)} by ${PAY_LABEL[refund_method]}`}</strong></p>
+      <p class="muted">${restock ? 'Items are back in stock.' : 'Marked damaged — not added back to stock.'}${offline ? ' Will sync when the internet is back.' : ''}</p>
+      <div class="actions"><button class="btn primary" data-close>Done</button></div>`);
+    $('[data-close]', modal).onclick = () => modal.close();
+  };
+
+  btn.disabled = true;
+  try {
+    if ((await getOutbox()).length) await trySync();
+    await api('/sale-returns', { method: 'POST', body });
+    if (refund_method === 'khata') cachedGet('/customers').then(fillCustomerList, () => {});
+    await finish(false);
+  } catch (err) {
+    if (!err.offline) return toast(err.message, true);
+    await enqueue({
+      kind: 'sale_return', path: '/sale-returns',
+      body: { ...body, created_at: new Date().toISOString() },
+      label: `Customer return ${rupees(total)}${who !== 'the customer' ? ' · ' + who : ''}`,
+      preview: { total, refund_method, customer_id: ret.sale?.customer_id ?? null, customer_name, customer_phone },
+    });
+    await finish(true);
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 // --- stock in & supplier purchases -------------------------------------
 
@@ -877,7 +1066,7 @@ $('#inv-list').onclick = (e) => {
 
 async function editProduct(id) {
   const [p, moves] = await Promise.all([api(`/products/${id}`), api(`/products/${id}/movements`)]);
-  const REASON = { stock_in: 'Stock in', sale: 'Sold', adjustment: 'Adjusted' };
+  const REASON = { stock_in: 'Stock in', sale: 'Sold', adjustment: 'Adjusted', purchase_return: 'Returned to supplier', sale_return: 'Customer return' };
   openModal(`
     <form id="edit-form">
       <h2>${esc(p.name)}</h2>
@@ -935,7 +1124,7 @@ const SIDES = {
     path: '/customers', noun: 'customer', totalLabel: 'Total udhaar outstanding', add: '+ Add customer / opening balance',
     none: 'No pending udhaar. 🎉', empty: 'No customers yet.', openingLabel: 'Already owes you (from your old khata) ₹',
     methods: ['cash', 'upi', 'card'], payLabel: 'Payment received ₹', payKind: 'payment',
-    types: { opening: 'Opening balance', credit_sale: 'Udhaar bill', payment: 'Payment received' },
+    types: { opening: 'Opening balance', credit_sale: 'Udhaar bill', payment: 'Payment received', return: 'Returned goods' },
     paidMsg: (amount, name) => `Recorded ${amount} from ${name}`,
   },
   supplier: {
@@ -964,6 +1153,10 @@ async function pendingBalanceDelta(side, party) {
     if (e.kind === SIDES[side].payKind && e.party_id === party.id) delta -= b.amount;
     if (side === 'customer' && e.kind === 'sale' && b.payment_method === 'credit' && sameParty(party, b.customer_name, b.customer_phone)) {
       delta += e.preview.total;
+    }
+    if (side === 'customer' && e.kind === 'sale_return' && b.refund_method === 'khata'
+      && (e.preview.customer_id ? e.preview.customer_id === party.id : sameParty(party, b.customer_name, b.customer_phone))) {
+      delta -= e.preview.total;
     }
     if (side === 'supplier' && e.kind === 'return' && b.supplier_id === party.id && b.settlement === 'adjust') {
       delta -= e.preview.total;
@@ -1179,7 +1372,7 @@ async function loadSales() {
   const pending = (await getOutbox()).filter((e) => e.kind === 'sale');
   const pendingTotal = pending.reduce((sum, e) => sum + e.preview.total, 0);
   $('#summary').innerHTML = (stale ? OFFLINE_NOTE : '') + (s ? `
-    <div><strong>${rupees(s.revenue + pendingTotal)}</strong><span>Today's sales${pending.length ? ' (incl. offline)' : ''}</span></div>
+    <div><strong>${rupees(s.revenue - (s.refunds ?? 0) + pendingTotal)}</strong><span>Today's sales${s.refunds ? `, after ${rupees(s.refunds)} returns` : ''}${pending.length ? ' (incl. offline)' : ''}</span></div>
     <div><strong>${s.bills + pending.length}</strong><span>Bills today</span></div>
     <div><strong>${rupees(s.udhaar_due)}</strong><span>Customers owe you</span></div>
     <div><strong>${rupees(s.supplier_due ?? 0)}</strong><span>You owe suppliers</span></div>
@@ -1251,9 +1444,92 @@ $('#report-side').onclick = (e) => {
 };
 function loadReports() {
   $('#sales-panel').classList.toggle('hidden', reportSide !== 'sales');
+  $('#profit-report').classList.toggle('hidden', reportSide !== 'profit');
   $('#supplier-report').classList.toggle('hidden', reportSide !== 'suppliers');
-  return reportSide === 'sales' ? loadSales() : loadSupplierReport();
+  $('#report-toolbar').classList.toggle('hidden', reportSide === 'sales');
+  return { sales: loadSales, profit: loadProfit, suppliers: loadSupplierReport }[reportSide]();
 }
+
+// --- profit report ------------------------------------------------------
+
+const TZ_OFFSET = -new Date().getTimezoneOffset(); // minutes east of UTC, e.g. 330 in India
+const profitPath = (range) => `/reports/profit?tz=${TZ_OFFSET}&${periodQuery(range)}`;
+let profitData = null;
+
+async function loadProfit() {
+  let stale;
+  try {
+    ({ data: profitData, stale } = await cachedGet(profitPath(periodRange($('#report-period').value))));
+  } catch (err) {
+    return toast(err.message, true);
+  }
+  if (!profitData) {
+    $('#profit-totals').innerHTML = OFFLINE_NOTE;
+    $('#profit-days').innerHTML = '';
+    $('#profit-list').innerHTML = '<p class="empty">Open this report once while online to keep a copy.</p>';
+    return;
+  }
+  const t = profitData.summary;
+  $('#profit-totals').innerHTML = (stale ? OFFLINE_NOTE : '') + `
+    <div><strong>${rupees(t.net_sales)}</strong><span>Net sales (${t.bills} bill${t.bills === 1 ? '' : 's'}${t.returns ? `, after ${rupees(t.returns)} returns` : ''})</span></div>
+    <div><strong>${rupees(t.cogs)}</strong><span>Cost of goods sold</span></div>
+    <div><strong class="${t.gross_profit < 0 ? 'amount-loss' : ''}">${rupees(t.gross_profit)}</strong><span>Gross profit</span></div>
+    <div><strong>${t.margin_pct === null ? '—' : t.margin_pct + '%'}</strong><span>Margin</span></div>
+    ${t.tax ? `<div><strong>${rupees(t.tax)}</strong><span>GST inside sales</span></div>
+      <div><strong>${rupees(t.gross_profit - t.tax)}</strong><span>Profit after GST (if you pay GST)</span></div>` : ''}`;
+  const warn = $('#profit-warning');
+  warn.classList.toggle('hidden', !t.products_without_cost);
+  const one = t.products_without_cost === 1;
+  warn.textContent = `${t.products_without_cost} product${one ? ' has' : 's have'} no cost price, so ${one ? 'its' : 'their'} `
+    + `whole sale shows as profit. Tap ${one ? 'it' : 'them'} below to set a cost price; future sales will use it.`;
+  renderProfitDays();
+  renderProfitList();
+}
+
+// One bar per day (per month for long periods); red bars are days that lost money.
+function renderProfitDays() {
+  let points = profitData.by_day.map((d) => ({ key: d.day, label: String(Number(d.day.slice(8))), profit: d.gross_profit }));
+  if (points.length > 62) {
+    const months = new Map();
+    for (const d of profitData.by_day) {
+      const k = d.day.slice(0, 7);
+      months.set(k, (months.get(k) ?? 0) + d.gross_profit);
+    }
+    points = [...months].map(([key, profit]) => ({
+      key, profit, label: new Date(key + '-01T00:00').toLocaleString('en-IN', { month: 'short' }),
+    }));
+  }
+  const max = Math.max(1, ...points.map((p) => Math.abs(p.profit)));
+  $('#profit-days').innerHTML = points.length
+    ? points.map((p) => `
+      <div class="bar${p.profit < 0 ? ' neg' : ''}" title="${p.key}: ${rupees(p.profit)}">
+        <i style="height:${Math.round((Math.abs(p.profit) / max) * 70)}px"></i><span>${p.label}</span>
+      </div>`).join('')
+    : '<p class="empty" style="width:100%">No sales in this period.</p>';
+}
+
+function renderProfitList() {
+  const sort = $('#profit-sort').value;
+  let rows = [...profitData.by_product];
+  if (sort === 'margin-low') rows = rows.filter((p) => p.margin_pct !== null).sort((a, b) => a.margin_pct - b.margin_pct);
+  if (sort === 'loss') rows = rows.filter((p) => p.gross_profit < 0).sort((a, b) => a.gross_profit - b.gross_profit);
+  $('#profit-list').innerHTML = rows.length
+    ? rows.map((p) => `
+      <li class="tap" data-id="${p.product_id}">
+        <div class="grow">
+          <div class="title">${esc(p.name)}${p.no_cost ? ' <span class="badge low">no cost price</span>' : ''}</div>
+          <div class="sub">${p.qty_sold} sold${p.qty_returned ? ` · ${p.qty_returned} returned` : ''} · sales ${rupees(p.net_sales)}${
+            p.margin_pct !== null ? ` · ${p.margin_pct}% margin` : ''}</div>
+        </div>
+        <strong class="${p.gross_profit < 0 ? 'amount-loss' : ''}">${rupees(p.gross_profit)}</strong>
+      </li>`).join('')
+    : `<p class="empty">${sort === 'loss' ? 'No product lost money in this period. 👍' : 'No sales in this period.'}</p>`;
+}
+$('#profit-sort').onchange = () => profitData && renderProfitList();
+$('#profit-list').onclick = (e) => {
+  const li = e.target.closest('li[data-id]');
+  if (li) editProduct(Number(li.dataset.id)).catch((err) => toast(err.offline ? 'Editing products needs internet' : err.message, true));
+};
 
 async function loadSupplierReport() {
   const range = periodRange($('#report-period').value);
@@ -1287,13 +1563,14 @@ async function loadSupplierReport() {
       </li>`).join('')
     : '<p class="empty">No supplier activity in this period.</p>';
 }
-$('#report-period').onchange = loadSupplierReport;
+$('#report-period').onchange = loadReports;
 $('#report-list').onclick = (e) => {
   const li = e.target.closest('li[data-id]');
   if (li) openSupplierReport(Number(li.dataset.id), periodRange($('#report-period').value));
 };
 $('#report-csv').onclick = () => {
   const range = periodRange($('#report-period').value);
+  if (reportSide === 'profit') return downloadCsv(profitPath(range) + '&format=csv', range.tag);
   downloadCsv('/reports/suppliers?format=csv&' + periodQuery(range), range.tag);
 };
 
@@ -1371,7 +1648,7 @@ document.querySelector('.tabs').onclick = (e) => {
 // Release the camera when the app goes to the background.
 document.addEventListener('visibilitychange', () => document.hidden && stopAllScanners());
 
-setupScanner('bill', addToCart);
+setupScanner('bill', (code) => (billMode === 'return' ? addToReturn(code) : addToCart(code)));
 setupScanner('stock', startStockIn);
 $('#shop-status').textContent = SHOP_NAME;
 $('#shop-status').onclick = () => {

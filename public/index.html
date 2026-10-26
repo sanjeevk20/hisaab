@@ -19,6 +19,10 @@
   <main>
     <!-- Billing -->
     <section id="view-bill" class="view active">
+      <div class="segmented" id="bill-mode" role="tablist">
+        <button data-mode="sale" class="active" role="tab">New sale</button>
+        <button data-mode="return" role="tab">Customer return</button>
+      </div>
       <div class="scanner" data-scanner="bill">
         <video playsinline muted></video>
         <div class="scan-frame"></div>
@@ -28,6 +32,35 @@
         <input name="code" placeholder="Type or scan barcode" inputmode="numeric" autocomplete="off">
         <button class="btn">Add</button>
       </form>
+
+      <div id="return-panel" class="hidden">
+        <form id="return-bill-form" class="manual">
+          <input name="bill" placeholder="Bill number (optional)" inputmode="numeric" autocomplete="off">
+          <button class="btn">Load bill</button>
+        </form>
+        <p id="return-bill-info" class="muted"></p>
+        <ul id="return-lines" class="list"></ul>
+        <p id="return-empty" class="empty">Load the customer's bill, or just scan what they brought back.</p>
+        <div id="return-checkout" class="card hidden">
+          <div class="row total"><span>Refund</span><strong id="return-total">₹0.00</strong></div>
+          <label class="chip"><input type="checkbox" id="return-restock" checked> Put back in stock (untick if damaged)</label>
+          <div class="pay-methods" id="return-refund">
+            <label><input type="radio" name="refund" value="cash" checked> Cash</label>
+            <label><input type="radio" name="refund" value="upi"> UPI</label>
+            <label><input type="radio" name="refund" value="card"> Card</label>
+            <label><input type="radio" name="refund" value="khata"> Off udhaar</label>
+          </div>
+          <div id="return-customer" class="hidden">
+            <input id="return-cust-name" placeholder="Customer name" list="customer-names" autocomplete="off">
+            <input id="return-cust-phone" placeholder="Customer phone" inputmode="tel" autocomplete="off">
+          </div>
+          <input id="return-why" placeholder="Reason (optional)" autocomplete="off">
+          <div class="actions">
+            <button id="return-clear" class="btn ghost" type="button">Clear</button>
+            <button id="return-save" class="btn primary" type="button">Complete return</button>
+          </div>
+        </div>
+      </div>
 
       <ul id="cart" class="list"></ul>
       <p id="cart-empty" class="empty">Scan an item to start a bill.</p>
@@ -164,24 +197,40 @@
     <section id="view-sales" class="view">
       <div class="segmented" id="report-side" role="tablist">
         <button data-side="sales" class="active" role="tab">Sales</button>
+        <button data-side="profit" role="tab">Profit</button>
         <button data-side="suppliers" role="tab">Suppliers</button>
+      </div>
+      <div id="report-toolbar" class="toolbar hidden">
+        <select id="report-period">
+          <option value="month">This month</option>
+          <option value="last-month">Last month</option>
+          <option value="quarter">Last 3 months</option>
+          <option value="fy">This financial year (from 1 April)</option>
+          <option value="all">All time</option>
+        </select>
+        <button id="report-csv" class="btn" type="button">⬇ CSV</button>
       </div>
       <div id="sales-panel">
         <div id="summary" class="stats"></div>
         <h2>Recent bills</h2>
         <ul id="sales-list" class="list"></ul>
       </div>
-      <div id="supplier-report" class="hidden">
+      <div id="profit-report" class="hidden">
+        <div id="profit-totals" class="stats"></div>
+        <p id="profit-warning" class="notice hidden"></p>
+        <h2>By day</h2>
+        <div id="profit-days" class="day-bars"></div>
         <div class="toolbar">
-          <select id="report-period">
-            <option value="month">This month</option>
-            <option value="last-month">Last month</option>
-            <option value="quarter">Last 3 months</option>
-            <option value="fy">This financial year (from 1 April)</option>
-            <option value="all">All time</option>
+          <h2 class="grow-title">By product</h2>
+          <select id="profit-sort">
+            <option value="profit">Most profit</option>
+            <option value="margin-low">Lowest margin</option>
+            <option value="loss">Losing money</option>
           </select>
-          <button id="report-csv" class="btn" type="button">⬇ CSV</button>
         </div>
+        <ul id="profit-list" class="list"></ul>
+      </div>
+      <div id="supplier-report" class="hidden">
         <div id="report-totals" class="stats"></div>
         <ul id="report-list" class="list"></ul>
       </div>

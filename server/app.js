@@ -401,7 +401,76 @@ function routes(store) {
     ['GET', /^\/api\/sales\/(\d+)$/, (_req, m) => {
       const sale = store.getSale(Number(m[1]));
       if (!sale) throw new HttpError(404, 'Bill not found');
+      sale.returnable = store.returnableFromSale(sale.id);
+      sale.returns = store.listSaleReturns({ saleId: sale.id });
       return sale;
+    }],
+
+    ['GET', /^\/api\/sale-returns$/, (_req, _m, url) =>
+      store.listSaleReturns({
+        saleId: Number(url.searchParams.get('sale_id')) || undefined,
+        limit: Math.min(Number(url.searchParams.get('limit')) || 50, 500),
+      })],
+
+    ['GET', /^\/api\/sale-returns\/(\d+)$/, (_req, m) => {
+      const r = store.getSaleReturn(Number(m[1]));
+      if (!r) throw new HttpError(404, 'Return not found');
+      return r;
+    }],
+
+    // Customer brings goods back: { sale_id?, items: [{ barcode, quantity }],
+    //   refund_method?: cash | upi | card | khata, restock? (false = damaged), reason?,
+    //   customer_id? | customer_name + customer_phone? (for khata without a bill), client_id?, created_at? }
+    ['POST', /^\/api\/sale-returns$/, async (req) => {
+      const body = await readJson(req);
+      if (!Array.isArray(body.items) || body.items.length === 0) throw new HttpError(400, 'Add at least one item');
+      if (body.items.length > 500) throw new HttpError(400, 'Too many items');
+      const items = body.items.map((it, i) => ({
+        barcode: str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 }),
+        quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }),
+      }));
+      const refund_method = body.refund_method ?? 'cash';
+      if (!['cash', 'upi', 'card', 'khata'].includes(refund_method)) {
+        throw new HttpError(400, 'refund_method must be cash, upi, card or khata');
+      }
+      if (body.restock !== undefined && typeof body.restock !== 'boolean') throw new HttpError(400, 'restock must be true or false');
+      const r = store.createSaleReturn({
+        sale_id: int(body.sale_id, 'sale_id', { min: 1 }) ?? null,
+        items, refund_method,
+        restock: body.restock ?? true,
+        reason: str(body.reason, 'reason') ?? null,
+        customer_id: int(body.customer_id, 'customer_id', { min: 1 }) ?? null,
+        customer_name: str(body.customer_name, 'customer_name') ?? null,
+        customer_phone: str(body.customer_phone, 'customer_phone', { max: 20 }) ?? null,
+        client_id: str(body.client_id, 'client_id', { max: 64 }) ?? null,
+        created_at: clientTime(body.created_at),
+      });
+      return [r.duplicate ? 200 : 201, r];
+    }],
+
+    // Gross profit for a period: ?from=&to= (UTC, default this month), &tz=330 (minutes east of UTC,
+    // for grouping by local day). &format=csv downloads per-product rows; add &by=day for daily rows.
+    ['GET', /^\/api\/reports\/profit$/, (_req, _m, url) => {
+      const tz = Number(url.searchParams.get('tz') ?? 0);
+      if (!Number.isInteger(tz) || Math.abs(tz) > 14 * 60) throw new HttpError(400, 'tz must be minutes from UTC, e.g. 330');
+      const report = store.profitReport({ ...period(url), tzOffset: tz });
+      if (url.searchParams.get('format') !== 'csv') return report;
+      const pct = (v) => (v === null ? '' : v.toFixed(1));
+      if (url.searchParams.get('by') === 'day') {
+        return csv(`profit-by-day_${periodTag(report)}.csv`, [
+          ['Date', 'Units sold', 'Sales', 'Returns', 'Net sales', 'Cost of goods', 'Gross profit', 'Margin %', 'GST in sales'],
+          ...report.by_day.map((d) => [d.day, d.qty_sold, money(d.gross_sales), money(d.returns), money(d.net_sales),
+            money(d.cogs), money(d.gross_profit), pct(d.margin_pct), money(d.tax)]),
+        ]);
+      }
+      const t = report.summary;
+      return csv(`profit-by-product_${periodTag(report)}.csv`, [
+        ['Product', 'Barcode', 'Units sold', 'Units returned', 'Sales', 'Returns', 'Net sales', 'Cost of goods', 'Gross profit', 'Margin %', 'GST in sales', 'Cost price missing'],
+        ...report.by_product.map((p) => [p.name, p.barcode, p.qty_sold, p.qty_returned, money(p.gross_sales), money(p.returns),
+          money(p.net_sales), money(p.cogs), money(p.gross_profit), pct(p.margin_pct), money(p.tax), p.no_cost ? 'yes' : '']),
+        ['Total', '', t.qty_sold, t.qty_returned, money(t.gross_sales), money(t.returns), money(t.net_sales), money(t.cogs),
+          money(t.gross_profit), pct(t.margin_pct), money(t.tax), t.products_without_cost || ''],
+      ]);
     }],
 
     // Checkout: { items: [{ product_id | barcode, quantity }], discount, payment_method,
