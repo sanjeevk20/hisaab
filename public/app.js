@@ -2021,7 +2021,9 @@ async function openSettings() {
     <form id="settings-form">
       ${account}
       <div class="settings-section">
-        ${loginsOn
+        ${globalThis.HISAAB_DEMO
+          ? '<p class="notice">This is the demo: everything is saved in this browser only. Owner and cashier logins, shared data across phones and encrypted backups need Hisaab running on your own server.</p>'
+          : loginsOn
           ? '<div class="row"><span>People who can sign in</span><button class="btn" type="button" data-people>👥 People</button></div>'
           : `<p class="notice">Anyone who opens this app can see and change everything. Set up an owner login to protect it, then add cashiers.</p>
              <button class="btn wide" type="button" data-setup>🔒 Set up owner login</button>`}
@@ -2060,7 +2062,7 @@ async function openSettings() {
           Invoices from it look like ${device ? esc(invoiceNumber(device.code, financialYear(localDate(nowSql(), shop.tz_offset)).short, 1)) : '—'}.</p>
         <p id="backup-health" class="muted">Checking backups…</p>
         <div class="actions">
-          <button class="btn" type="button" data-backup>🛟 Backups</button>
+          ${globalThis.HISAAB_DEMO ? '' : '<button class="btn" type="button" data-backup>🛟 Backups</button>'}
           <button class="btn" type="button" data-audit>Change log</button>
         </div>
       </div>
@@ -2070,9 +2072,9 @@ async function openSettings() {
   $('[data-signout]', form)?.addEventListener('click', signOut);
   $('[data-people]', form)?.addEventListener('click', openPeople);
   $('[data-setup]', form)?.addEventListener('click', openOwnerSetup);
-  $('[data-backup]', form).onclick = openBackups;
+  $('[data-backup]', form)?.addEventListener('click', openBackups);
   $('[data-audit]', form).onclick = openAuditLog;
-  api('/backup/config').then((b) => {
+  if (!globalThis.HISAAB_DEMO) api('/backup/config').then((b) => {
     const el = $('#backup-health');
     if (!el) return;
     const problem = backupProblem(b);
@@ -2456,5 +2458,5 @@ async function boot() {
 boot();
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(() => { /* offline shell is a bonus, not required */ });
+  navigator.serviceWorker.register('sw.js').catch(() => { /* offline shell is a bonus, not required */ });
 }

@@ -112,6 +112,19 @@ npm run restore -- data/backups/hisaab-2026-10-26T12-13-15-870.db.enc restored.d
 
 The restore checks the passphrase and the database's integrity before writing anything, and never overwrites an existing file. Re-enter the off-site settings afterwards.
 
+## Try the demo
+
+**https://sanjeevk20.github.io/hisaab/**: open it on a phone or computer. It starts with a sample shop (a week of bills, udhaar, a supplier and GST invoices). The camera scanner works there too, since the page is on https.
+
+The demo runs Hisaab's real server code inside the browser: SQLite compiled to WebAssembly, saved in the browser's own storage. It works offline after the first visit. Its limits:
+- everything stays in that one browser on that one device
+- there are no owner/cashier logins and no backups
+- clearing the browser's data, or *Start over*, wipes it
+
+To run a real shop, use the server below.
+
+The demo is built by `npm run build:demo` (output in `dist/`, needs `npm install` for the build tools) and published by `.github/workflows/pages.yml` on every push to `main`. One-time setup: **Settings → Pages → Source: GitHub Actions**.
+
 ## Run it
 
 Requires Node.js 22.13+ (uses the built-in SQLite — no `npm install` needed).
@@ -211,6 +224,7 @@ server/app.js     JSON API + static hosting
 server/index.js   entry point (HTTP/HTTPS, daily backups)
 server/context.js who is making the current request
 server/backup.js  encrypted backups, S3 / WebDAV / folder upload
+demo/             browser-only demo for GitHub Pages: sql.js adapter, Node stand-ins, build script
 scripts/restore.js  decrypt and check a backup
 public/           mobile web app (no build step)
   gst.js          GST rules shared by server and app: GSTIN check, states, rates, tax split, numbering, FY

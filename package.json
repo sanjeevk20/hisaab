@@ -10,7 +10,13 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server/index.js",
     "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.js\"",
-    "restore": "node --disable-warning=ExperimentalWarning scripts/restore.js"
+    "restore": "node --disable-warning=ExperimentalWarning scripts/restore.js",
+    "build:demo": "node demo/build.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "buffer": "6.0.3",
+    "esbuild": "0.28.2",
+    "sql.js": "1.15.2"
+  }
 }
