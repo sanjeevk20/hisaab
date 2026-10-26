@@ -159,3 +159,18 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
 }
 .shop-name { background: none; border: 0; font: inherit; cursor: pointer; padding: 0; }
 a.btn { text-decoration: none; text-align: center; }
+.tabs { grid-template-columns: repeat(5, 1fr); }
+.topbar { gap: 8px; }
+.topbar h1 { margin-right: auto; }
+.sync-chip {
+  font: inherit; font-size: 12px; font-weight: 600; border: 0; border-radius: 99px;
+  padding: 3px 10px; background: rgba(255,255,255,.2); color: inherit; cursor: pointer;
+}
+.sync-chip.offline { background: #fbbf24; color: #3b2300; }
+.sync-chip.error { background: #fecaca; color: #7f1d1d; }
+.btn.wide { width: 100%; margin: 10px 0 0; }
+.stats.one { grid-template-columns: 1fr; margin-bottom: 10px; }
+.amount-due { color: var(--danger); font-weight: 700; white-space: nowrap; }
+.amount-clear { color: var(--muted); white-space: nowrap; }
+.pending { border-style: dashed !important; }
+.notice { background: #fef3c7; color: #78350f; border-radius: 8px; padding: 8px 12px; font-size: 14px; margin: 8px 0; }

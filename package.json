@@ -1,6 +1,6 @@
 {
   "name": "hisaab",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Billing and inventory for small retailers: scan barcodes with the phone camera to stock in, scan again to bill.",
   "private": true,
   "type": "module",

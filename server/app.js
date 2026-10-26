@@ -49,6 +49,15 @@ function rate(v) {
   return v;
 }
 
+// Time an offline device says an action happened (ISO 8601) → SQLite UTC text.
+function clientTime(v) {
+  if (v === undefined || v === null) return null;
+  const t = typeof v === 'string' ? Date.parse(v) : NaN;
+  if (Number.isNaN(t)) throw new HttpError(400, 'created_at must be an ISO date');
+  if (t > Date.now() + 5 * 60_000) throw new HttpError(400, 'created_at is in the future');
+  return new Date(t).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 function productFields(body, { partial }) {
   const fields = {
     barcode: str(body.barcode, 'barcode', { required: !partial, max: 64 }),
@@ -151,16 +160,57 @@ function routes(store) {
     ['GET', /^\/api\/products\/(\d+)\/movements$/, (_req, m) => store.movements(Number(m[1]))],
 
     // Scan-to-stock: adds quantity to an existing barcode, or creates the product if it is new.
+    // A repeated client_id (an offline retry) is a no-op that returns the product.
     ['POST', /^\/api\/stock-in$/, async (req) => {
       const body = await readJson(req);
       const barcode = str(body.barcode, 'barcode', { required: true, max: 64 });
       const quantity = int(body.quantity, 'quantity', { required: true, min: 1, max: 1e6 });
-      const existing = store.getByBarcode(barcode);
-      if (existing) {
-        return { created: false, product: store.adjustStock(existing.id, quantity, 'stock_in', str(body.note, 'note') ?? null) };
-      }
-      const product = store.createProduct(productFields({ ...body, barcode, quantity }, { partial: false }));
-      return [201, { created: true, product }];
+      const clientId = str(body.client_id, 'client_id', { max: 64 }) ?? null;
+      return store.transaction(() => {
+        const seen = clientId && store.productForMovement(clientId);
+        if (seen) return { created: false, duplicate: true, product: seen };
+        const existing = store.getByBarcode(barcode);
+        if (existing) {
+          const product = store.adjustStock(existing.id, quantity, 'stock_in', str(body.note, 'note') ?? null, clientId);
+          return { created: false, product };
+        }
+        const product = store.createProduct(productFields({ ...body, barcode, quantity }, { partial: false }), clientId);
+        return [201, { created: true, product }];
+      });
+    }],
+
+    ['GET', /^\/api\/customers$/, (_req, _m, url) =>
+      store.listCustomers({ q: url.searchParams.get('q'), dueOnly: url.searchParams.get('due') === '1' })],
+
+    // { name, phone?, opening_balance? } — opening_balance carries over dues from a paper khata.
+    ['POST', /^\/api\/customers$/, async (req) => {
+      const body = await readJson(req);
+      return [201, store.createCustomer({
+        name: str(body.name, 'name', { required: true }),
+        phone: str(body.phone, 'phone', { max: 20 }) ?? null,
+        opening_balance: int(body.opening_balance, 'opening_balance') ?? 0,
+      })];
+    }],
+
+    ['GET', /^\/api\/customers\/(\d+)$/, (_req, m) => {
+      const c = store.getCustomer(Number(m[1]));
+      if (!c) throw new HttpError(404, 'Customer not found');
+      return c;
+    }],
+
+    // { amount, method?, note?, client_id?, created_at? }
+    ['POST', /^\/api\/customers\/(\d+)\/payments$/, async (req, m) => {
+      const body = await readJson(req);
+      const method = body.method ?? 'cash';
+      if (!['cash', 'upi', 'card'].includes(method)) throw new HttpError(400, 'method must be cash, upi or card');
+      const { duplicate, customer } = store.recordPayment(Number(m[1]), {
+        amount: int(body.amount, 'amount', { required: true, min: 1 }),
+        method,
+        note: str(body.note, 'note') ?? null,
+        client_id: str(body.client_id, 'client_id', { max: 64 }) ?? null,
+        created_at: clientTime(body.created_at),
+      });
+      return [duplicate ? 200 : 201, customer];
     }],
 
     ['GET', /^\/api\/sales$/, (_req, _m, url) =>
@@ -176,26 +226,35 @@ function routes(store) {
       return sale;
     }],
 
-    // Checkout: { items: [{ product_id, quantity }], discount, payment_method, customer_name, customer_phone }
+    // Checkout: { items: [{ product_id | barcode, quantity }], discount, payment_method,
+    //   customer_id | customer_name + customer_phone, client_id?, created_at?, offline? }
+    // payment_method 'credit' (udhaar) adds the total to the customer's khata.
+    // offline: true marks a sale already made without internet; it is accepted even if stock ran short.
     ['POST', /^\/api\/sales$/, async (req) => {
       const body = await readJson(req);
       if (!Array.isArray(body.items) || body.items.length === 0) throw new HttpError(400, 'Add at least one item');
       if (body.items.length > 500) throw new HttpError(400, 'Too many items');
-      const items = body.items.map((it, i) => ({
-        product_id: int(it?.product_id, `items[${i}].product_id`, { required: true, min: 1 }),
-        quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }),
-      }));
+      const items = body.items.map((it, i) => {
+        const product_id = int(it?.product_id, `items[${i}].product_id`, { min: 1 });
+        const barcode = product_id ? undefined : str(it?.barcode, `items[${i}].barcode`, { required: true, max: 64 });
+        return { product_id, barcode, quantity: int(it?.quantity, `items[${i}].quantity`, { required: true, min: 1, max: 1e6 }) };
+      });
       const payment_method = body.payment_method ?? 'cash';
       if (!PAYMENT_METHODS.includes(payment_method)) {
         throw new HttpError(400, `payment_method must be one of ${PAYMENT_METHODS.join(', ')}`);
       }
-      return [201, store.createSale({
+      const sale = store.createSale({
         items,
         discount: int(body.discount, 'discount') ?? 0,
         payment_method,
+        customer_id: int(body.customer_id, 'customer_id', { min: 1 }) ?? null,
         customer_name: str(body.customer_name, 'customer_name') ?? null,
         customer_phone: str(body.customer_phone, 'customer_phone', { max: 20 }) ?? null,
-      })];
+        client_id: str(body.client_id, 'client_id', { max: 64 }) ?? null,
+        created_at: clientTime(body.created_at),
+        allowOversell: body.offline === true,
+      });
+      return [sale.duplicate ? 200 : 201, sale];
     }],
   ];
 }
@@ -225,6 +284,9 @@ export function createHandler(store, { pin } = {}) {
       if (err instanceof HttpError) return send(res, err.status, { error: err.message });
       if (/UNIQUE constraint failed: products\.barcode/.test(err?.message)) {
         return send(res, 409, { error: 'Another product already uses this barcode' });
+      }
+      if (/UNIQUE constraint failed: customers\.phone/.test(err?.message)) {
+        return send(res, 409, { error: 'Another customer already uses this phone number' });
       }
       console.error(err);
       send(res, 500, { error: 'Something went wrong' });

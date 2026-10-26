@@ -12,6 +12,7 @@
 <body>
   <header class="topbar">
     <h1>Hisaab</h1>
+    <button id="sync-status" class="sync-chip hidden" title="Offline queue"></button>
     <button id="shop-status" class="muted shop-name" title="Change shop name"></button>
   </header>
 
@@ -41,8 +42,10 @@
           <label><input type="radio" name="pay" value="card"> Card</label>
           <label><input type="radio" name="pay" value="credit"> Udhaar</label>
         </div>
-        <input id="cust-name" placeholder="Customer name (optional)">
-        <input id="cust-phone" placeholder="Customer phone (optional)" inputmode="tel">
+        <input id="cust-name" placeholder="Customer name (optional)" list="customer-names" autocomplete="off">
+        <input id="cust-phone" placeholder="Customer phone (optional)" inputmode="tel" autocomplete="off">
+        <datalist id="customer-names"></datalist>
+        <p id="cust-due" class="muted hidden"></p>
         <div class="actions">
           <button id="clear-cart" class="btn ghost" type="button">Clear</button>
           <button id="do-checkout" class="btn primary" type="button">Complete sale</button>
@@ -95,6 +98,17 @@
       <ul id="inv-list" class="list"></ul>
     </section>
 
+    <!-- Udhaar khata -->
+    <section id="view-udhaar" class="view">
+      <div class="stats one"><div><strong id="udhaar-total">₹0.00</strong><span>Total udhaar outstanding</span></div></div>
+      <div class="toolbar">
+        <input id="cust-search" type="search" placeholder="Search name or phone">
+        <label class="chip"><input type="checkbox" id="cust-due-only" checked> Dues only</label>
+      </div>
+      <button id="add-customer" class="btn wide" type="button">+ Add customer / opening balance</button>
+      <ul id="cust-list" class="list"></ul>
+    </section>
+
     <!-- Sales -->
     <section id="view-sales" class="view">
       <div id="summary" class="stats"></div>
@@ -107,6 +121,7 @@
     <button data-view="bill" class="active">🧾<span>Bill</span></button>
     <button data-view="stock">📦<span>Stock in</span></button>
     <button data-view="inventory">📋<span>Inventory</span></button>
+    <button data-view="udhaar">📒<span>Udhaar</span></button>
     <button data-view="sales">📈<span>Sales</span></button>
   </nav>
 

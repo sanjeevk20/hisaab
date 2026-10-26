@@ -6,7 +6,9 @@ A phone-first web app for kirana / small retail shops:
 - **Bill** — scan items into a cart, apply a discount, pick Cash / UPI / Card / Udhaar, complete the sale. Sold quantities are **removed from stock automatically** in the same database transaction as the bill. If any item is short, nothing is written.
 - **Receipt** — print it, or send it to the customer on WhatsApp.
 - **Inventory** — search, low-stock filter, edit prices, correct stock (damage, recount), and see a full history of every stock movement.
-- **Sales** — today's revenue, bill count, stock value, low-stock count, and recent bills.
+- **Udhaar khata** — choose *Udhaar* at checkout and the bill goes on the customer's account (matched by phone, or by name for regulars). See who owes what, record full or part payments (cash / UPI / card), send a WhatsApp reminder, and carry over balances from your paper khata as an opening balance.
+- **Works offline** — the app opens without internet, scanning works from a saved copy of your products, and bills, stock-ins and udhaar payments are saved on the phone and synced automatically when the connection returns.
+- **Sales** — today's revenue, bill count, udhaar outstanding, stock value, low-stock count, and recent bills.
 
 Products are never deleted when they sell out — they drop to 0 and show as *Out of stock*, so the next restock is still a single scan and past bills stay intact.
 
@@ -41,37 +43,56 @@ On the phone, use the browser's *Add to Home screen* to install it like an app. 
 
 Scanning uses the native `BarcodeDetector` on Android Chrome and falls back to [ZXing](https://github.com/zxing-js/library) (loaded from unpkg) on iPhone Safari and others. Supported: EAN-13/8, UPC-A/E, Code 128/39, ITF, QR. A USB/Bluetooth barcode gun also works — it types into the barcode box.
 
+## Offline mode
+
+- A service worker keeps the app itself (and the iPhone scanning library) cached, so it opens with no signal.
+- The product catalog and customer list are saved on the phone (IndexedDB) and refreshed whenever you're online.
+- Without internet, **bills, stock-ins and udhaar payments go into a queue** on the phone. A chip in the header shows `Offline · N pending`; tap it to see the queue or *Sync now*. The queue is sent in order as soon as the connection returns (and every 30 seconds while anything is pending).
+- **No double entries:** every queued action has a unique `client_id`. If a request reached the server but the reply was lost, the retry is recognised and ignored.
+- **Bills keep their real time** — offline bills are recorded with the time they were made, not the time they synced.
+- **Stock conflicts:** if another device sold the same stock while this one was offline, the offline sale is still accepted (the goods already left the shop). Stock stops at 0 and the shortfall is logged in the product's history as *"please recount"*. Online checkouts still refuse to oversell.
+- If the server rejects a queued entry (for example, invalid data), it stays in the queue marked *Rejected* with the reason, so you can retry or discard it. It is never silently dropped.
+- Needs internet: editing products, stock corrections, adding a customer by hand (you can still bill a new customer on udhaar offline), and opening old bills.
+
+Using more than one phone? Each phone syncs to the same server, so stock and khata stay shared.
+
 ## API
 
-All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills report the GST contained in the total.
+All amounts are integer **paise** (₹1 = 100). Prices are GST-inclusive; bills report the GST contained in the total. Write endpoints accept an optional `client_id`; repeating a request with the same `client_id` returns the original result instead of recording it again.
 
 | Method & path | Body / query | Does |
 | --- | --- | --- |
-| `POST /api/stock-in` | `{barcode, quantity, name?, price?, cost?, gst_rate?, low_stock?}` | Restock a known barcode, or create a new product (name + price required) |
+| `POST /api/stock-in` | `{barcode, quantity, name?, price?, cost?, gst_rate?, low_stock?, client_id?}` | Restock a known barcode, or create a new product (name + price required) |
 | `GET /api/products` | `?q=` search, `?low=1` | List products |
 | `GET /api/products/barcode/:code` | | Look up by barcode |
 | `POST /api/products` | product fields | Create product |
 | `PATCH /api/products/:id` | any of name, price, cost, gst_rate, low_stock, barcode | Edit product |
 | `POST /api/products/:id/stock` | `{change, reason: "stock_in"\|"adjustment", note?}` | Manual stock change |
 | `GET /api/products/:id/movements` | | Stock history |
-| `POST /api/sales` | `{items:[{product_id, quantity}], discount?, payment_method?, customer_name?, customer_phone?}` | Create bill + remove stock (atomic) |
+| `POST /api/sales` | `{items:[{product_id \| barcode, quantity}], discount?, payment_method?: cash\|upi\|card\|credit, customer_id? \| customer_name? + customer_phone?, client_id?, created_at?, offline?}` | Create bill + remove stock (atomic). `credit` puts it on the customer's khata |
+| `GET /api/customers` | `?q=`, `?due=1` | Customers with current balance, largest dues first |
+| `POST /api/customers` | `{name, phone?, opening_balance?}` | Add customer (opening balance from a paper khata) |
+| `GET /api/customers/:id` | | Customer, balance and khata entries |
+| `POST /api/customers/:id/payments` | `{amount, method?, note?, client_id?, created_at?}` | Record an udhaar payment (can't exceed the balance) |
 | `GET /api/sales`, `GET /api/sales/:id` | `?from=&to=&limit=` | Bills |
 | `GET /api/summary` | `?since=YYYY-MM-DD HH:MM:SS` (UTC) | Dashboard numbers |
 
 ## Layout
 
 ```
-server/db.js      schema + data access (SQLite, transactions, stock ledger)
+server/db.js      schema, migrations + data access (SQLite, transactions, stock ledger, udhaar khata)
 server/app.js     JSON API + static hosting
 server/index.js   entry point (HTTP/HTTPS)
 public/           mobile web app (no build step)
+  offline.js      IndexedDB cache, outbox queue and sync
+  sw.js           service worker (offline app shell) — bump CACHE when changing app files
 test/             API tests (node:test)
 ```
 
 ## Possible next steps
 
 - Multi-user logins and roles (owner vs. cashier), multiple shops
-- Purchase entries with supplier and invoice, customer credit (udhaar) ledger
+- Purchase entries with supplier and invoice, supplier dues
 - Full GST invoices (GSTIN, HSN codes, CGST/SGST split), thermal printer support
-- Offline mode with background sync; product lookup from a public barcode catalog
+- Product lookup from a public barcode catalog; SMS reminders for udhaar
 - Native app wrapper (Capacitor) if Play Store distribution is needed
