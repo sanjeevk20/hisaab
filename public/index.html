@@ -104,6 +104,15 @@
           <button id="do-checkout" class="btn primary" type="button">Complete sale</button>
         </div>
       </div>
+
+      <!-- Stays above the tabs while the bill's own buttons are scrolled out of view. -->
+      <div id="charge-bar" class="charge-bar hidden">
+        <button id="charge-summary" type="button" aria-label="Show bill details">
+          <strong id="charge-total">₹0.00</strong>
+          <span id="charge-meta"></span>
+        </button>
+        <button id="charge-go" class="btn primary" type="button">Charge</button>
+      </div>
     </section>
 
     <!-- Stock in -->

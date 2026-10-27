@@ -102,10 +102,14 @@ function sampleGstin(state, pan) {
 async function seed() {
   const call = async (path, method, body) => {
     const r = await handle(new URL('/api' + path, location.href), { method, body: JSON.stringify(body) });
-    if (!r.ok) console.warn('demo seed', path, await r.text());
-    return r.json();
+    const data = await r.json();
+    if (!r.ok) console.warn('demo seed', path, data.error);
+    return data;
   };
-  const daysAgo = (d, h = 11) => new Date(Date.now() - d * 86_400_000 - (new Date().getHours() - h) * 3_600_000).toISOString();
+  // d days ago at about h o'clock, but never later than a minute ago (early in the day, "today at 11" is still ahead).
+  const daysAgo = (d, h = 11) => new Date(Math.min(
+    Date.now() - d * 86_400_000 - (new Date().getHours() - h) * 3_600_000, Date.now() - 60_000,
+  )).toISOString();
 
   await call('/settings', 'PUT', {
     legal_name: 'Sharma General Stores', trade_name: 'Sharma Kirana (demo)', address: '12 MG Road, Bengaluru 560001',

@@ -21,6 +21,7 @@ const readQty = (v) => round3(parseFloat(v) || 0);
 // SQLite stores UTC 'YYYY-MM-DD HH:MM:SS'; show it in local time.
 const localTime = (s) => new Date(s.replace(' ', 'T') + 'Z').toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
 const digits = (s) => String(s ?? '').replace(/\D/g, '').replace(/^91(\d{10})$/, '$1');
+let billMode = 'sale'; // 'sale' or 'return'; see setBillMode below
 const PAY_LABEL = { cash: 'Cash', upi: 'UPI', card: 'Card', credit: 'Udhaar', bank: 'Bank', cheque: 'Cheque' };
 const OFFLINE_NOTE = '<p class="notice">Offline — showing the copy saved on this phone.</p>';
 
@@ -441,7 +442,39 @@ function renderCartTotals() {
   const { subtotal, total } = cartTotals();
   $('#subtotal').textContent = rupees(subtotal);
   $('#total').textContent = rupees(total);
+  updateChargeBar();
 }
+
+// --- charge bar: total and Charge button pinned above the tabs ---------------------------------
+
+let checkoutButtonsVisible = false;
+
+function updateChargeBar() {
+  const show = billMode === 'sale' && cart.size > 0 && !checkoutButtonsVisible;
+  $('#charge-bar').classList.toggle('hidden', !show);
+  if (!show) return;
+  const items = cart.size;
+  $('#charge-total').textContent = rupees(cartTotals().total);
+  $('#charge-meta').textContent = `${items} item${items === 1 ? '' : 's'} · ${PAY_LABEL[$('input[name=pay]:checked').value]}`;
+}
+
+new IntersectionObserver(([entry]) => {
+  checkoutButtonsVisible = entry.isIntersecting;
+  updateChargeBar();
+}).observe($('#checkout .actions'));
+
+const showCheckout = () => $('#checkout .actions').scrollIntoView({ behavior: 'smooth', block: 'end' });
+$('#charge-summary').onclick = showCheckout;
+$('#charge-go').onclick = () => {
+  // Udhaar needs a name or phone, so take the cashier to those fields instead of failing.
+  const credit = $('input[name=pay]:checked').value === 'credit';
+  if (credit && !$('#cust-name').value.trim() && !$('#cust-phone').value.trim()) {
+    showCheckout();
+    $('#cust-name').focus({ preventScroll: true });
+    return toast('Enter the customer name for udhaar', true);
+  }
+  $('#do-checkout').click();
+};
 
 function renderCart() {
   const list = $('#cart');
@@ -501,7 +534,7 @@ $('#cart').addEventListener('change', (e) => {
   }
 });
 $('#discount').oninput = renderCart;
-$('.pay-methods').onchange = renderCart;
+$('#checkout .pay-methods').onchange = renderCart;
 $('#clear-cart').onclick = () => {
   if (confirm('Clear this bill?')) resetBill();
 };
@@ -713,7 +746,6 @@ function plainReceiptHtml(sale) {
 // Lines coming back, keyed by barcode: { barcode, name, quantity, unit_price, max }. With a bill
 // loaded, every line on it is listed (max = what can still come back) and scans count them up;
 // without one, scans add products at today's price.
-let billMode = 'sale';
 let ret = { sale: null, lines: new Map() };
 
 function setBillMode(mode) {
@@ -723,6 +755,7 @@ function setBillMode(mode) {
   $('#return-panel').classList.toggle('hidden', !isReturn);
   for (const sel of ['#cart', '#cart-empty', '#checkout']) $(sel).classList.toggle('hidden', isReturn);
   $('[data-manual=bill] button').textContent = isReturn ? 'Return' : 'Add';
+  updateChargeBar();
   if (isReturn) {
     renderReturn();
     loadReturnAllowance();
